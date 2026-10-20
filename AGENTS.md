@@ -85,3 +85,23 @@ ccr daemon install --interval 900
 - [dsh-quota-bridge](../dsh-quota-bridge)：**额度**通路（DSH 账号余额 → CC Switch 卡片额度栏），
   走 `provider.meta.usage_script`；本项目做的是**用量统计**通路（会话日志 → 看板）。
   两者数据来源完全不同，改动时不要互相牵连。
+
+## 发布流程
+
+1. 版本对齐：`Cargo.toml` 与 `npm/package.json` 的 `version` 同步（CI 会用 tag 名覆盖 npm 版本）。
+2. 打 tag 推送：
+   ```bash
+   git tag -a v0.1.1 -m "v0.1.1" && git push origin v0.1.1
+   ```
+3. `release.yml` 会自动：
+   - 交叉编译 4 个目标（`x86_64/aarch64-unknown-linux-musl`、`x86_64/aarch64-apple-darwin`）
+   - 把裸二进制 + `.tar.gz` 传到 GitHub Release（npm 的 postinstall 依赖这些文件名：
+     `ccr-<target>`）
+   - 若仓库配置了 `NPM_TOKEN` secret，顺带 `npm publish`；没配置则显式跳过（不报红）
+4. 手动发布 npm（未配置 secret 时）：
+   ```bash
+   cd npm && npm login && npm publish --access public
+   ```
+
+⚠️ npm 包的 postinstall 按 `package.json` 的版本拼下载地址，所以**必须先有对应 tag 的 Release**，
+再发 npm。
