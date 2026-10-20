@@ -1,1 +1,4 @@
 /target
+npm/node_modules
+npm/*.tgz
+.DS_Store
