@@ -66,8 +66,6 @@ jobs:
   npm:
     needs: release
     runs-on: ubuntu-latest
-    env:
-      NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
     steps:
       - uses: actions/checkout@v4
 
@@ -79,12 +77,20 @@ jobs:
       - name: publish to npm
         working-directory: npm
         shell: bash
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           set -euo pipefail
-          if [ -z "${NODE_AUTH_TOKEN:-}" ]; then
-            echo "NPM_TOKEN 未配置，跳过 npm 发布（配置后重跑本 job 即可）"
+          # 没配 NPM_TOKEN 就跳过，不让 CI 变红
+          if ! npm whoami >/dev/null 2>&1; then
+            echo "::notice::未配置可用的 NPM_TOKEN，跳过 npm 发布"
             exit 0
           fi
-          VERSION="${GITHUB_REF_NAME#v}"
+          if [ "${GITHUB_REF_TYPE:-}" = "tag" ]; then
+            VERSION="${GITHUB_REF_NAME#v}"
+          else
+            VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' ../Cargo.toml | head -1)"
+          fi
+          echo "发布 cc-remote-usage@$VERSION"
           npm version "$VERSION" --no-git-tag-version --allow-same-version
           npm publish --access public
