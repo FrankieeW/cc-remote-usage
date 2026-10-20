@@ -79,3 +79,9 @@ ccr daemon install --interval 900
 - 依赖 CC Switch ≥ 4.0（`sessions sync-usage --json` 输出 `imported` / `filesScanned`）。
 - `cc-switch` 路径：配置 > PATH > `/opt/homebrew/bin/cc-switch`。
 - 若上游改 JSON 字段名，`sync.rs::import` 会以 "输出不是预期 JSON" 明确报错。
+
+## 姊妹项目
+
+- [dsh-quota-bridge](../dsh-quota-bridge)：**额度**通路（DSH 账号余额 → CC Switch 卡片额度栏），
+  走 `provider.meta.usage_script`；本项目做的是**用量统计**通路（会话日志 → 看板）。
+  两者数据来源完全不同，改动时不要互相牵连。

@@ -1,5 +1,7 @@
 # ccr — 服务器 agent 用量 → CC Switch 统一看板
 
+[![release](https://github.com/FrankieeW/cc-remote-usage/actions/workflows/release.yml/badge.svg)](https://github.com/FrankieeW/cc-remote-usage/actions/workflows/release.yml)
+
 CC Switch 的「用量」看板只扫**本机**的会话日志（`~/.codex/sessions`、`~/.claude/projects`，受
 `CODEX_HOME` / `CLAUDE_CONFIG_DIR` 控制），所以跑在 VPS / 服务器上的 Codex、Claude Code
 agent 消耗不会出现在里面。
@@ -10,13 +12,22 @@ agent 消耗不会出现在里面。
 
 ## 安装
 
+**npm（推荐，自动匹配平台二进制）**
+
 ```bash
-cd cc-remote-usage
-cargo build --release --offline
-cp target/release/ccr /opt/homebrew/bin/ccr
+npm i -g cc-remote-usage
+ccr --version
 ```
 
-（离线构建，依赖都用本地 registry 缓存；也可以去掉 `--offline`。）
+**直接下载二进制**：到 [Releases](https://github.com/FrankieeW/cc-remote-usage/releases) 取
+`ccr-<target>`（macOS / Linux，arm64 / x64），`chmod +x` 后丢进 `PATH`。
+
+**本地构建**
+
+```bash
+cargo build --release --offline   # 离线；去掉 --offline 也可
+cp target/release/ccr /opt/homebrew/bin/ccr
+```
 
 ## 用法
 
