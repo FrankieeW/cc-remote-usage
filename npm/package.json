@@ -1,0 +1,39 @@
+{
+  "name": "cc-remote-usage",
+  "version": "0.1.0",
+  "description": "把服务器上 Codex / Claude Code agent 的用量同步进 CC Switch（自动发现 SSH 主机 + 交互选择）",
+  "bin": {
+    "ccr": "bin/ccr.js"
+  },
+  "scripts": {
+    "postinstall": "node scripts/postinstall.js"
+  },
+  "files": [
+    "bin",
+    "scripts",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "keywords": [
+    "cc-switch",
+    "ccswitch",
+    "codex",
+    "claude-code",
+    "usage",
+    "token",
+    "cli",
+    "rust",
+    "ssh"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/FrankieeW/cc-remote-usage.git"
+  },
+  "homepage": "https://github.com/FrankieeW/cc-remote-usage",
+  "bugs": {
+    "url": "https://github.com/FrankieeW/cc-remote-usage/issues"
+  }
+}
