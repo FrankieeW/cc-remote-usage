@@ -38,8 +38,18 @@ cargo build --release --offline   # 本机 crates.io 403，必须离线
 cargo test --offline              # 51 个单测 + 7 个端到端（tests/cli.rs）：
                                   # 单测里用本机 sh 直接跑远端脚本（macOS 上即 BSD 工具）；
                                   # 端到端用假 ssh / cc-switch 跑真二进制，覆盖 sync 全流程
-cp target/release/ccr /opt/homebrew/bin/ccr
 ```
+
+安装（**本机现在是 npm 管理的**，见下方「安装方式」一节）：
+
+```bash
+npm i -g cc-remote-usage          # 推荐：自动匹配平台二进制，postinstall 从 Release 下载
+```
+
+⚠️ **不要**再跑 `cp target/release/ccr /opt/homebrew/bin/ccr`：该路径现在是 npm 的符号链接
+（→ `../lib/node_modules/cc-remote-usage/bin/ccr.js`），`cp` 会穿透符号链接把 npm 的 shim
+覆盖成 Rust 二进制，破坏 npm 包。本地开发直接用 `./target/release/ccr` 跑；
+若要覆盖 PATH 里的二进制，先 `rm` 掉符号链接再 `cp`（注意备份）。
 
 ```bash
 ccr hosts --probe        # 发现 + 探测
@@ -94,6 +104,21 @@ ccr daemon install --interval 900
 | 并行跑测试时锁偶尔"释放了还拿不到" | 别的测试线程 fork 子进程，exec 前短暂持有 fd 副本 | 测试里重试，生产无影响 |
 | 同一台 Mac 被同步好几遍 | 多个别名指向同一台机器 | 探测指纹去重，`hosts --probe` 标为「重复」 |
 | 本机 `find` 测试结论与远端不符 | Claude Code 的 shell 把 `find` 包成了 bfs | 验证 BSD 行为用 `/usr/bin/find` 或 `sh -c` |
+
+## 安装方式
+
+本机用 **npm 全局安装**（npm 前缀 = `/opt/homebrew`，与二进制路径一致）：
+
+| 项 | 值 |
+|---|---|
+| npm 包 | `cc-remote-usage`（注意包名不是 `ccr`） |
+| PATH 入口 | `/opt/homebrew/bin/ccr` → `../lib/node_modules/cc-remote-usage/bin/ccr.js`（node shim） |
+| 平台二进制 | `<npm root -g>/cc-remote-usage/vendor/<platform>-<arch>/ccr`（postinstall 从 Release 下载） |
+| 定时任务 | launchd 直接调 `/opt/homebrew/bin/ccr`，走 shim 也正常（node 在 `/opt/homebrew/bin`） |
+
+升级：`npm i -g cc-remote-usage`。postinstall 按 `package.json` 的 version 拼下载地址，
+所以 **必须先有对应 tag 的 GitHub Release**，再发 npm。npm 11 会对 install script 打印
+`allow-scripts` 警告，但默认仍会执行；装完用 `ccr --version` 确认。
 
 ## 数据位置
 
