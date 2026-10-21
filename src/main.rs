@@ -7,16 +7,25 @@
 
 mod daemon;
 mod hosts;
+mod mirror;
 mod report;
+mod select;
+mod ssh;
+mod state;
 mod sync;
 
-use anyhow::Result;
+use anyhow::{bail, Result};
 use clap::{Parser, Subcommand};
-use serde::{Deserialize, Serialize};
+use select::{
+    check_hosts, initial_hosts, parse_host_list, pick_hosts, probe_candidates, skip_cooling,
+};
+use state::{
+    backoff_secs, cc_switch_bin, config_path, cooling_until, load_config, load_state, now_epoch,
+    record_failure, record_success, root, save_config, save_state, Config, State,
+};
 use std::collections::BTreeMap;
-use std::fs;
-use std::io::{IsTerminal, Write};
-use std::path::PathBuf;
+use std::io::Write;
+use std::time::SystemTime;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -105,6 +114,9 @@ enum Cmd {
         /// 设置退避：基础分钟,上限分钟（如 15,360）
         #[arg(long)]
         set_backoff: Option<String>,
+        /// 设置镜像保留天数（按文件修改时间清理，0 表示不清理）
+        #[arg(long)]
+        set_retain_days: Option<u64>,
     },
 }
 
@@ -122,226 +134,6 @@ enum DaemonCmd {
     Uninstall,
     /// 查看定时任务状态
     Status,
-}
-
-// ---------------------------------------------------------------- 配置与状态
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct Config {
-    #[serde(default)]
-    pub hosts: Vec<String>,
-    #[serde(default = "default_days")]
-    pub days: u64,
-    /// cc-switch 可执行文件路径，留空自动探测
-    #[serde(default)]
-    pub cc_switch: Option<String>,
-    /// 连续失败后的基础冷却（分钟），默认 15
-    #[serde(default = "default_backoff_base")]
-    pub backoff_base_min: u64,
-    /// 冷却上限（分钟），默认 360
-    #[serde(default = "default_backoff_max")]
-    pub backoff_max_min: u64,
-}
-
-fn default_days() -> u64 {
-    2
-}
-
-fn default_backoff_base() -> u64 {
-    15
-}
-
-fn default_backoff_max() -> u64 {
-    360
-}
-
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            hosts: Vec::new(),
-            days: default_days(),
-            cc_switch: None,
-            backoff_base_min: default_backoff_base(),
-            backoff_max_min: default_backoff_max(),
-        }
-    }
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone, Default)]
-pub struct State {
-    #[serde(default)]
-    pub hosts: BTreeMap<String, HostState>,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone, Default)]
-pub struct HostState {
-    /// 上次成功同步的 epoch 秒，作为下次增量起点
-    #[serde(default)]
-    pub last_epoch: i64,
-    /// 上次成功同步时间（可读）
-    #[serde(default)]
-    pub last_run: String,
-    /// 上次导入的用量条数
-    #[serde(default)]
-    pub last_imported: i64,
-    /// 上次扫描的日志文件数
-    #[serde(default)]
-    pub last_scanned: i64,
-    /// 连续失败次数
-    #[serde(default)]
-    pub failures: u32,
-    /// 冷却结束时间（epoch 秒），0 表示无冷却
-    #[serde(default)]
-    pub next_attempt: i64,
-    /// 最近一次失败原因
-    #[serde(default)]
-    pub last_error: String,
-}
-
-/// 指数退避：失败越多、间隔越长，成功后清零。
-/// 默认 15m → 30m → 1h → 2h → 4h → 6h（上限），上限可通过配置调整。
-fn backoff_secs(cfg: &Config, failures: u32) -> i64 {
-    let base = cfg.backoff_base_min.max(1) as i64 * 60;
-    let max = cfg
-        .backoff_max_min
-        .max(cfg.backoff_base_min)
-        .max(1) as i64
-        * 60;
-    let shift = failures.saturating_sub(1).min(10);
-    base.saturating_mul(1i64 << shift).min(max)
-}
-
-fn now_epoch() -> i64 {
-    chrono::Local::now().timestamp()
-}
-
-fn fmt_epoch(ts: i64) -> String {
-    chrono::DateTime::<chrono::Utc>::from_timestamp(ts, 0)
-        .map(|d| {
-            d.with_timezone(&chrono::Local)
-                .format("%m-%d %H:%M")
-                .to_string()
-        })
-        .unwrap_or_else(|| "-".to_string())
-}
-
-/// 该主机是否还在冷却窗口内；是则返回冷却结束时间。
-fn cooling_until(state: &State, host: &str) -> Option<i64> {
-    state.hosts.get(host).and_then(|s| {
-        if s.next_attempt > now_epoch() {
-            Some(s.next_attempt)
-        } else {
-            None
-        }
-    })
-}
-
-fn record_success(state: &mut State, host: &str, started: i64, imported: i64, scanned: i64) {
-    state.hosts.insert(
-        host.to_string(),
-        HostState {
-            last_epoch: started,
-            last_run: chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
-            last_imported: imported,
-            last_scanned: scanned,
-            failures: 0,
-            next_attempt: 0,
-            last_error: String::new(),
-        },
-    );
-}
-
-fn record_failure(cfg: &Config, state: &mut State, host: &str, err: &str) {
-    let prev = state.hosts.get(host).cloned().unwrap_or_default();
-    let failures = prev.failures.saturating_add(1);
-    let next = now_epoch() + backoff_secs(cfg, failures);
-    let brief: String = err.lines().next().unwrap_or("").chars().take(120).collect();
-    state.hosts.insert(
-        host.to_string(),
-        HostState {
-            failures,
-            next_attempt: next,
-            last_error: brief,
-            ..prev
-        },
-    );
-}
-
-pub fn home() -> PathBuf {
-    std::env::var("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("."))
-}
-
-/// 镜像与状态根目录，可用 REMOTE_USAGE_ROOT 覆盖
-pub fn root() -> PathBuf {
-    if let Ok(r) = std::env::var("REMOTE_USAGE_ROOT") {
-        if !r.is_empty() {
-            return PathBuf::from(r);
-        }
-    }
-    home().join(".cc-switch").join("remote-usage")
-}
-
-fn config_path() -> PathBuf {
-    root().join("config.json")
-}
-
-fn state_path() -> PathBuf {
-    root().join("state.json")
-}
-
-pub fn load_config() -> Config {
-    fs::read_to_string(config_path())
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default()
-}
-
-pub fn save_config(cfg: &Config) -> Result<()> {
-    fs::create_dir_all(root())?;
-    fs::write(config_path(), serde_json::to_string_pretty(cfg)?)?;
-    Ok(())
-}
-
-pub fn load_state() -> State {
-    fs::read_to_string(state_path())
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default()
-}
-
-pub fn save_state(s: &State) -> Result<()> {
-    fs::create_dir_all(root())?;
-    fs::write(state_path(), serde_json::to_string_pretty(s)?)?;
-    Ok(())
-}
-
-/// 解析 cc-switch 可执行文件：配置 > PATH > 常见 Homebrew 路径
-pub fn cc_switch_bin() -> String {
-    if let Some(p) = load_config().cc_switch {
-        if !p.is_empty() {
-            return p;
-        }
-    }
-    if let Some(p) = which("cc-switch") {
-        return p;
-    }
-    "/opt/homebrew/bin/cc-switch".to_string()
-}
-
-pub fn which(bin: &str) -> Option<String> {
-    let path = std::env::var("PATH").unwrap_or_default();
-    for dir in path.split(':') {
-        if dir.is_empty() {
-            continue;
-        }
-        let p = PathBuf::from(dir).join(bin);
-        if p.is_file() {
-            return Some(p.to_string_lossy().into_owned());
-        }
-    }
-    None
 }
 
 // ---------------------------------------------------------------- 入口
@@ -375,18 +167,24 @@ fn run(cli: Cli) -> Result<()> {
             host,
             daily,
             json,
-        } => report::run(days, host.as_deref(), daily, json),
+        } => report::run(
+            days,
+            host.as_deref(),
+            daily,
+            json,
+            load_config().retain_days,
+        ),
         Cmd::Status => cmd_status(),
         Cmd::Daemon { action } => match action {
             DaemonCmd::Install { interval, hosts } => {
-                let list = hosts
-                    .map(|s| {
-                        s.split(',')
-                            .map(|x| x.trim().to_string())
-                            .filter(|x| !x.is_empty())
-                            .collect::<Vec<_>>()
-                    })
-                    .unwrap_or_else(|| load_config().hosts);
+                let list = match hosts {
+                    Some(s) => parse_host_list(&s)?,
+                    None => {
+                        let configured = load_config().hosts;
+                        check_hosts(&configured)?;
+                        configured
+                    }
+                };
                 daemon::install(interval, &list)
             }
             DaemonCmd::Uninstall => daemon::uninstall(),
@@ -396,7 +194,31 @@ fn run(cli: Cli) -> Result<()> {
             set_hosts,
             set_days,
             set_backoff,
-        } => cmd_config(set_hosts, set_days, set_backoff),
+            set_retain_days,
+        } => cmd_config(set_hosts, set_days, set_backoff, set_retain_days),
+    }
+}
+
+// ---------------------------------------------------------------- 公共
+
+fn fmt_epoch(ts: i64) -> String {
+    chrono::DateTime::<chrono::Utc>::from_timestamp(ts, 0)
+        .map(|d| {
+            d.with_timezone(&chrono::Local)
+                .format("%m-%d %H:%M")
+                .to_string()
+        })
+        .unwrap_or_else(|| "-".to_string())
+}
+
+fn human_dur(secs: i64) -> String {
+    let m = (secs / 60).max(1);
+    if m < 60 {
+        format!("{m} 分钟")
+    } else if m % 60 == 0 {
+        format!("{} 小时", m / 60)
+    } else {
+        format!("{} 小时 {} 分钟", m / 60, m % 60)
     }
 }
 
@@ -419,7 +241,7 @@ fn cmd_hosts(probe: bool, json: bool, force: bool) -> Result<()> {
             return Ok(());
         }
         println!("发现 {} 台候选主机：\n", specs.len());
-        println!("  {:<24}{}", "主机", "来源");
+        println!("  {:<24}来源", "主机");
         for s in &specs {
             println!("  {:<24}{}", s.id, s.source);
         }
@@ -428,7 +250,7 @@ fn cmd_hosts(probe: bool, json: bool, force: bool) -> Result<()> {
     }
 
     let cfg = load_config();
-    let mut state = load_state();
+    let state = load_state();
 
     // 冷却中的主机不重复探测，避免反复赔超时
     let mut skipped: Vec<(String, i64)> = Vec::new();
@@ -443,14 +265,24 @@ fn cmd_hosts(probe: bool, json: bool, force: bool) -> Result<()> {
         ids.push(s.id.clone());
     }
 
-    let results = hosts::probe_many(&ids);
-    for (h, p) in &results {
-        if !p.ok {
-            record_failure(&cfg, &mut state, h, p.err.as_deref().unwrap_or("ssh 失败"));
+    let (results, local_fps) = hosts::probe_with_local(&ids);
+    // 探测期间不占锁（免得挡住定时任务）；落盘时再拿锁，基于最新状态只合并失败记录，
+    // 不会用探测开始时读到的旧状态覆盖同步刚写下的断点
+    let recorded = match state::try_lock_runs()? {
+        Some(_lock) => {
+            let mut fresh = load_state();
+            for (h, p) in &results {
+                if !p.ok {
+                    record_failure(&cfg, &mut fresh, h, p.err.as_deref().unwrap_or("ssh 失败"));
+                }
+            }
+            let _ = save_state(&fresh);
+            true
         }
-    }
-    let _ = save_state(&state);
+        None => false,
+    };
 
+    let dups = hosts::duplicates(&results, &local_fps, |h| hosts::source_rank(&specs, h));
     let by_id: BTreeMap<&str, &hosts::Probe> =
         results.iter().map(|(h, p)| (h.as_str(), p)).collect();
 
@@ -459,10 +291,8 @@ fn cmd_hosts(probe: bool, json: bool, force: bool) -> Result<()> {
             .iter()
             .map(|s| {
                 let p = by_id.get(s.id.as_str());
-                let cooling = skipped
-                    .iter()
-                    .find(|(h, _)| h == &s.id)
-                    .map(|(_, t)| *t);
+                let cooling = skipped.iter().find(|(h, _)| h == &s.id).map(|(_, t)| *t);
+                let dup = dups.get(&s.id);
                 serde_json::json!({
                     "host": s.id,
                     "source": s.source,
@@ -472,6 +302,11 @@ fn cmd_hosts(probe: bool, json: bool, force: bool) -> Result<()> {
                     "codex_size": p.map(|p| p.size.clone()).unwrap_or_default(),
                     "error": p.and_then(|p| p.err.clone()),
                     "cooling_until": cooling,
+                    "duplicate_of": match dup {
+                        Some(hosts::Skip::SameAs(h)) => Some(h.as_str()),
+                        _ => None,
+                    },
+                    "is_local": matches!(dup, Some(hosts::Skip::Local)),
                 })
             })
             .collect();
@@ -480,57 +315,51 @@ fn cmd_hosts(probe: bool, json: bool, force: bool) -> Result<()> {
     }
 
     println!(
-        "  {:<22}{:<10}{:>8}{:>8}{:>8}  {}",
-        "主机", "状态", "Codex", "Claude", "大小", "来源"
+        "  {:<22}{:<10}{:>8}{:>8}{:>8}  来源",
+        "主机", "状态", "Codex", "Claude", "大小"
     );
     for s in &specs {
         if let Some((_, until)) = skipped.iter().find(|(h, _)| h == &s.id) {
-            let failures = state
-                .hosts
-                .get(&s.id)
-                .map(|x| x.failures)
-                .unwrap_or(0);
+            let failures = state.hosts.get(&s.id).map(|x| x.failures).unwrap_or(0);
             println!(
-                "  {:<22}{:<10}{:>8}{:>8}{:>8}  {}",
+                "  {:<22}{:<10}{:>8}{:>8}{:>8}  连续失败 {failures} 次，{} 再试",
                 s.id,
                 "冷却中",
                 0,
                 0,
                 "-",
-                format!("连续失败 {failures} 次，{} 再试", fmt_epoch(*until))
+                fmt_epoch(*until)
             );
             continue;
         }
-        match by_id.get(s.id.as_str()) {
-            Some(p) if p.ok => {
-                println!(
-                    "  {:<22}{:<10}{:>8}{:>8}{:>8}  {}",
-                    s.id,
-                    if p.active() { "可同步" } else { "无日志" },
-                    p.codex,
-                    p.claude,
-                    if p.size.is_empty() { "-" } else { &p.size },
-                    s.source
-                );
-            }
-            Some(p) => {
-                println!(
-                    "  {:<22}{:<10}{:>8}{:>8}{:>8}  {}",
-                    s.id,
-                    "不可达",
-                    0,
-                    0,
-                    "-",
-                    p.err
-                        .as_deref()
-                        .unwrap_or("ssh 失败")
-                        .chars()
-                        .take(40)
-                        .collect::<String>()
-                );
-            }
-            None => {}
+        let Some(p) = by_id.get(s.id.as_str()) else {
+            continue;
+        };
+        let size = if p.size.is_empty() { "-" } else { &p.size };
+        if !p.ok {
+            let err: String = p
+                .err
+                .as_deref()
+                .unwrap_or("ssh 失败")
+                .chars()
+                .take(40)
+                .collect();
+            println!(
+                "  {:<22}{:<10}{:>8}{:>8}{:>8}  {err}",
+                s.id, "不可达", 0, 0, "-"
+            );
+            continue;
         }
+        let (status, note) = match dups.get(&s.id) {
+            Some(hosts::Skip::Local) => ("本机", hosts::Skip::Local.describe()),
+            Some(skip) => ("重复", skip.describe()),
+            None if p.active() => ("可同步", s.source.clone()),
+            None => ("无日志", s.source.clone()),
+        };
+        println!(
+            "  {:<22}{:<10}{:>8}{:>8}{:>8}  {note}",
+            s.id, status, p.codex, p.claude, size
+        );
     }
     if !skipped.is_empty() {
         println!(
@@ -538,73 +367,63 @@ fn cmd_hosts(probe: bool, json: bool, force: bool) -> Result<()> {
             skipped.len()
         );
     }
+    if !dups.is_empty() {
+        println!("\n标为重复 / 本机的主机在 sync --all 时自动跳过（同一份日志只拉一次）。");
+    }
+    if !recorded {
+        println!("\n（有同步正在运行，本次探测结果没有计入退避状态）");
+    }
     Ok(())
 }
 
 // ---------------------------------------------------------------- sync
 
-/// 探测候选主机：跳过冷却中的（避免反复赔超时），把探测失败计入退避。
-fn probe_candidates(
-    cfg: &Config,
-    state: &mut State,
-    quiet: bool,
-    respect_backoff: bool,
-) -> Result<Vec<(String, hosts::Probe)>> {
-    let specs = hosts::discover();
-    if specs.is_empty() {
-        anyhow::bail!("没发现任何 SSH 主机，用 `ccr config --set-hosts a,b` 指定");
-    }
-
-    let mut ids: Vec<String> = Vec::new();
-    let mut cooling = 0usize;
-    for s in &specs {
-        if respect_backoff {
-            if let Some(until) = cooling_until(state, &s.id) {
-                cooling += 1;
-                if !quiet {
-                    eprintln!("  跳过 {}（冷却中，{} 再试）", s.id, fmt_epoch(until));
-                }
-                continue;
-            }
+/// 导入完成后按保留期清理镜像（先导入后清理，删掉的都是早已入库的旧文件）。
+/// 配置文件解析失败时不清理：按默认值删文件可能违背用户的设置（比如 `retain_days: 0`）。
+fn prune_mirrors(cfg: &Config, config_ok: bool, quiet: bool) {
+    if !config_ok {
+        if !quiet {
+            println!("配置文件解析失败，本轮不清理镜像。");
         }
-        ids.push(s.id.clone());
+        return;
     }
-
-    if ids.is_empty() {
-        if cooling > 0 {
-            anyhow::bail!("候选主机都在退避冷却中（{cooling} 台），用 --force 强制重试");
-        }
-        anyhow::bail!("没有候选主机");
+    let pruned = mirror::prune(&root(), cfg.retain_days, SystemTime::now());
+    if !quiet && pruned.files > 0 {
+        println!(
+            "清理镜像：删除 {} 个超过 {} 天未更新的日志，释放 {}",
+            pruned.files,
+            cfg.retain_days,
+            report::human_size(pruned.bytes)
+        );
     }
-
-    if !quiet {
-        eprintln!("正在探测 {} 台候选主机…", ids.len());
-    }
-    let results = hosts::probe_many(&ids);
-    for (h, p) in &results {
-        if !p.ok {
-            record_failure(cfg, state, h, p.err.as_deref().unwrap_or("ssh 失败"));
-        }
-    }
-    Ok(results
-        .into_iter()
-        .filter(|(_, p)| p.active())
-        .collect())
 }
 
-fn human_dur(secs: i64) -> String {
-    let m = (secs / 60).max(1);
-    if m < 60 {
-        format!("{m} 分钟")
-    } else if m % 60 == 0 {
-        format!("{} 小时", m / 60)
-    } else {
-        format!("{} 小时 {} 分钟", m / 60, m % 60)
+fn print_outcome(cfg: &Config, state: &State, outcome: &sync::Outcome) {
+    match &outcome.err {
+        None => println!(
+            "  ✓ 导入 {} 条（扫描 {} 个文件，镜像 {} 个）",
+            outcome.imported, outcome.scanned, outcome.mirror_files
+        ),
+        Some(e) => {
+            let failures = state
+                .hosts
+                .get(&outcome.host)
+                .map(|s| s.failures)
+                .unwrap_or(1);
+            println!("  ✗ {e}");
+            println!(
+                "    已降低重试频率：{} 后再试（连续失败 {failures} 次）",
+                human_dur(backoff_secs(cfg, failures))
+            );
+        }
+    }
+    for line in sync::warning_summary(&outcome.warnings) {
+        println!("  ⚠ cc-switch：{line}");
     }
 }
 
 fn cmd_sync(
-    mut hosts: Vec<String>,
+    cli_hosts: Vec<String>,
     all: bool,
     days: Option<u64>,
     force: bool,
@@ -612,126 +431,113 @@ fn cmd_sync(
     dry_run: bool,
     quiet: bool,
 ) -> Result<()> {
-    let cfg = load_config();
+    let (cfg, config_ok) = state::load_config_checked();
     let days = days.unwrap_or(cfg.days).max(1);
-    let mut state = load_state();
+    let (mut hosts, explicit) = initial_hosts(cli_hosts, std::env::var("REMOTE_USAGE_HOSTS").ok());
+    let respect_backoff = !(force || retry_now);
 
-    // 0) 环境变量覆盖（给 launchd 定时任务用）
-    if hosts.is_empty() {
-        if let Ok(list) = std::env::var("REMOTE_USAGE_HOSTS") {
-            hosts = list
-                .split_whitespace()
-                .map(|s| s.to_string())
-                .filter(|s| !s.is_empty())
-                .collect();
+    // 0) 同一时刻只跑一个同步（定时任务与手动执行会撞车）；dry-run 不改任何东西，不必抢锁
+    let mut lock = None;
+    if !dry_run {
+        lock = state::try_lock_runs()?;
+        if lock.is_none() {
+            if !quiet {
+                println!("另一个 ccr sync 正在运行（可能是定时任务），本次跳过。");
+            }
+            return Ok(());
         }
     }
-
-    // 命令行点名的主机：无视冷却（用户明确要求重试）
-    let explicit = !hosts.is_empty();
+    // 拿到锁之后再读状态，才能看到上一个进程写下的断点
+    let mut state = load_state();
 
     // 1) 决定要同步哪些主机
-    if hosts.is_empty() && !all {
-        if !cfg.hosts.is_empty() {
+    if hosts.is_empty() {
+        if !all && !cfg.hosts.is_empty() {
             hosts = cfg.hosts.clone();
             if !quiet {
                 println!("使用配置里的默认主机：{}", hosts.join(", "));
             }
         } else {
-            // 自动发现 + 探测 + 交互多选
-            let active = probe_candidates(&cfg, &mut state, quiet, !(force || retry_now))?;
-            if active.is_empty() {
-                anyhow::bail!("没有可达且带 agent 日志的主机");
+            // 自动发现 + 探测：只挑可达且有日志的，避免挨个卡在 SSH 超时上
+            let probed = probe_candidates(&cfg, &mut state, quiet, respect_backoff)?;
+            if !dry_run {
+                // 探测失败也要计入退避，哪怕下面一台可同步的都没有
+                save_state(&state)?;
             }
-
-            let interactive = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
-            if interactive {
-                let labels: Vec<String> = active
-                    .iter()
-                    .map(|(h, p)| {
-                        format!(
-                            "{:<22} codex {:>3} 文件  claude {:>3} 文件  {}",
-                            h,
-                            p.codex,
-                            p.claude,
-                            if p.size.is_empty() { "-" } else { &p.size }
-                        )
-                    })
-                    .collect();
-                let defaults: Vec<bool> = active.iter().map(|_| true).collect();
-                let picked = dialoguer::MultiSelect::new()
-                    .with_prompt("空格选择要同步的服务器，回车确认")
-                    .items(&labels)
-                    .defaults(&defaults)
-                    .interact()?;
-                hosts = picked.into_iter().map(|i| active[i].0.clone()).collect();
-                if hosts.is_empty() {
-                    println!("没有选择任何服务器，已取消。");
-                    return Ok(());
+            if probed.active.is_empty() {
+                if !dry_run {
+                    prune_mirrors(&cfg, config_ok, quiet);
                 }
+                if probed.all_unreachable() {
+                    // 全军覆没多半是本机网络或 SSH agent 的问题，必须让定时任务日志看得到
+                    let (h, e) = &probed.unreachable[0];
+                    bail!(
+                        "本轮探测的 {} 台主机全部连不上（如 {h}：{e}），\
+                         先检查本机网络 / SSH agent；各台原因见 ccr status",
+                        probed.probed
+                    );
+                }
+                if !quiet {
+                    println!("没有可达且带近期 agent 日志的主机（详情：ccr hosts --probe）。");
+                }
+                return Ok(());
+            }
+            hosts = if all || !select::interactive() {
+                probed.active.iter().map(|(h, _)| h.clone()).collect()
             } else {
-                hosts = active.iter().map(|(h, _)| h.clone()).collect();
-            }
-        }
-    } else if hosts.is_empty() {
-        // --all：只挑可达且有日志的，避免挨个卡在 SSH 超时上
-        let active = probe_candidates(&cfg, &mut state, quiet, !(force || retry_now))?;
-        if active.is_empty() {
-            anyhow::bail!("没有可达且带 agent 日志的主机");
-        }
-        hosts = active.iter().map(|(h, _)| h.clone()).collect();
-        if !quiet {
-            println!("同步 {} 台有日志的主机：{}", hosts.len(), hosts.join(", "));
-        }
-    }
-
-    if hosts.is_empty() {
-        anyhow::bail!("没有指定要同步的主机");
-    }
-
-    // 1.5) 退避冷却：连续失败的机器降低尝试频率（命令行点名 / --force 不挡）
-    if !force && !retry_now && !explicit {
-        let mut cooled: Vec<(String, i64, u32)> = Vec::new();
-        let mut ready: Vec<String> = Vec::new();
-        for h in &hosts {
-            match cooling_until(&state, h) {
-                Some(t) => cooled.push((
-                    h.clone(),
-                    t,
-                    state.hosts.get(h).map(|s| s.failures).unwrap_or(0),
-                )),
-                None => ready.push(h.clone()),
-            }
-        }
-        if !cooled.is_empty() {
-            if !quiet {
-                println!("跳过 {} 台冷却中的主机：", cooled.len());
-                for (h, t, f) in &cooled {
-                    println!("  - {h}（连续失败 {f} 次，{} 再试）", fmt_epoch(*t));
+                // 交互多选可能停很久，期间不占锁，免得定时任务整轮被跳过
+                drop(lock.take());
+                let picked = pick_hosts(&probed.active)?;
+                if !dry_run {
+                    lock = state::try_lock_runs()?;
+                    if lock.is_none() {
+                        println!("选择期间定时任务开始了同步，本次跳过，稍后再试。");
+                        return Ok(());
+                    }
+                    state = load_state();
                 }
+                picked
+            };
+            if hosts.is_empty() {
+                println!("没有选择任何服务器，已取消。");
+                return Ok(());
             }
-            hosts = ready;
+            if all && !quiet {
+                println!("同步 {} 台有日志的主机：{}", hosts.len(), hosts.join(", "));
+            }
         }
+    }
+    // 不管来自命令行、定时任务还是配置文件，主机名都会被当作 ssh 参数和镜像目录名
+    check_hosts(&hosts)?;
+
+    // 1.5) 退避冷却：连续失败的机器降低尝试频率（命令行点名 / --force / --retry-now 不挡）
+    if respect_backoff && !explicit {
+        hosts = skip_cooling(&state, hosts, quiet);
         if hosts.is_empty() {
-            save_state(&state)?;
             if !quiet {
-                println!("本轮没有需要同步的主机（全部在冷却中）。用 --force 强制重试。");
+                println!("本轮没有需要同步的主机（全部在冷却中）。立即重试用 --retry-now。");
+            }
+            if !dry_run {
+                prune_mirrors(&cfg, config_ok, quiet);
             }
             return Ok(());
         }
     }
 
-    // 2) 逐台同步
-    let mut outcomes = Vec::new();
-    let total = hosts.len();
+    if dry_run {
+        for (i, host) in hosts.iter().enumerate() {
+            eprintln!("[{}/{}] {}", i + 1, hosts.len(), host);
+            println!("  (dry-run) 将同步 {host}，回溯 {days} 天");
+        }
+        println!("\n(dry-run) 未执行任何同步。");
+        return Ok(());
+    }
 
+    // 2) 逐台同步；每台结束立即落盘，中途被杀也不丢已完成主机的断点
+    let mut outcomes = Vec::new();
     for (i, host) in hosts.iter().enumerate() {
         if !quiet {
-            eprintln!("[{}/{}] {}", i + 1, total, host);
-        }
-        if dry_run {
-            println!("  (dry-run) 将同步 {host}，回溯 {days} 天");
-            continue;
+            eprintln!("[{}/{}] {}", i + 1, hosts.len(), host);
         }
         let since = if force {
             0
@@ -741,65 +547,44 @@ fn cmd_sync(
                 .get(host)
                 .map(|h| h.last_epoch)
                 .filter(|e| *e > 0)
-                .unwrap_or_else(|| chrono::Local::now().timestamp() - (days as i64) * 86400)
+                .unwrap_or_else(|| now_epoch() - (days as i64) * 86400)
         };
-        let started = chrono::Local::now().timestamp();
-        let outcome = sync::sync_host(host, since, quiet);
-        if !quiet {
-            match &outcome.err {
-                None => println!(
-                    "  ✓ 导入 {} 条（扫描 {} 个文件，镜像 {} 个）",
-                    outcome.imported, outcome.scanned, outcome.mirror_files
-                ),
-                Some(e) => {
-                    println!("  ✗ {e}");
-                    let next_failures =
-                        state.hosts.get(host).map(|s| s.failures).unwrap_or(0) + 1;
-                    println!(
-                        "    已降低重试频率：{} 后再试（连续失败 {} 次）",
-                        human_dur(backoff_secs(&cfg, next_failures)),
-                        next_failures
-                    );
-                }
-            }
-        }
+        let started = now_epoch();
+        let outcome = sync::sync_host(host, since);
         match &outcome.err {
-            None => record_success(
-                &mut state,
-                host,
-                started,
-                outcome.imported,
-                outcome.scanned,
-            ),
+            None => record_success(&mut state, host, started, outcome.imported, outcome.scanned),
             Some(e) => record_failure(&cfg, &mut state, host, e),
+        }
+        save_state(&state)?;
+        if !quiet {
+            print_outcome(&cfg, &state, &outcome);
         }
         outcomes.push(outcome);
     }
 
-    if dry_run {
-        println!("\n(dry-run) 未执行任何同步。");
+    // 3) 清理过期镜像（必须在导入之后）
+    prune_mirrors(&cfg, config_ok, quiet);
+
+    if quiet {
+        for o in &outcomes {
+            if let Some(e) = &o.err {
+                eprintln!("{}: {e}", o.host);
+            }
+            for line in sync::warning_summary(&o.warnings) {
+                eprintln!("{}: cc-switch：{line}", o.host);
+            }
+        }
         return Ok(());
     }
 
-    save_state(&state)?;
-
-    if !quiet {
-        let ok = outcomes.iter().filter(|o| o.err.is_none()).count();
-        let imported: i64 = outcomes.iter().map(|o| o.imported).sum();
-        println!(
-            "\n完成：{ok}/{} 台成功，共导入 {imported} 条用量记录（CC Switch 看板约 30 秒内刷新）",
-            outcomes.len()
-        );
-        if imported > 0 {
-            println!("查看明细：ccr report --days 2");
-        }
-    }
-
-    let failed: Vec<_> = outcomes.iter().filter(|o| o.err.is_some()).collect();
-    if !failed.is_empty() && quiet {
-        for o in failed {
-            eprintln!("{}: {}", o.host, o.err.clone().unwrap_or_default());
-        }
+    let ok = outcomes.iter().filter(|o| o.err.is_none()).count();
+    let imported: i64 = outcomes.iter().map(|o| o.imported).sum();
+    println!(
+        "\n完成：{ok}/{} 台成功，共导入 {imported} 条用量记录（CC Switch 看板约 30 秒内刷新）",
+        outcomes.len()
+    );
+    if imported > 0 {
+        println!("查看明细：ccr report --days 2");
     }
     Ok(())
 }
@@ -812,20 +597,18 @@ fn cmd_status() -> Result<()> {
         println!("还没有同步记录。先跑一次：ccr sync");
         return Ok(());
     }
+    let cfg = load_config();
     println!(
-        "  {:<20}{:<21}{:>8}{:>6}{:>16}{:>10}",
+        "  {:<23}{:<21}{:>8}{:>6}{:>16}{:>10}",
         "主机", "上次成功同步", "导入", "失败", "下次尝试", "镜像"
     );
     for (host, hs) in &state.hosts {
-        let dir = root().join(host);
-        let bytes = report::dir_size(&dir);
-        let next = if hs.next_attempt > now_epoch() {
-            fmt_epoch(hs.next_attempt)
-        } else {
-            "-".to_string()
-        };
+        let bytes = report::dir_size(&root().join(host));
+        let next = cooling_until(&state, host)
+            .map(fmt_epoch)
+            .unwrap_or_else(|| "-".to_string());
         println!(
-            "  {:<20}{:<21}{:>8}{:>6}{:>16}{:>10}",
+            "  {:<23}{:<21}{:>8}{:>6}{:>16}{:>10}",
             host,
             if hs.last_run.is_empty() {
                 "-"
@@ -851,16 +634,21 @@ fn cmd_status() -> Result<()> {
     if !failing.is_empty() {
         println!("\n失败原因：");
         for (h, s) in failing {
-            let backoff = human_dur(backoff_secs(&load_config(), s.failures));
+            let backoff = human_dur(backoff_secs(&cfg, s.failures));
             println!(
-                "  {h:<20}连续失败 {} 次（退避 {backoff}）：{}",
+                "  {h:<23}连续失败 {} 次（退避 {backoff}）：{}",
                 s.failures, s.last_error
             );
         }
-        println!("\n想立刻重试：ccr sync <主机>  或  ccr sync --all --force");
+        println!("\n想立刻重试：ccr sync <主机>  或  ccr sync --all --retry-now");
     }
 
-    println!("\n根目录：{}", root().display());
+    let retain = match cfg.retain_days {
+        0 => "不清理".to_string(),
+        d => format!("{d} 天（按文件修改时间）"),
+    };
+    println!("\n镜像保留：{retain}");
+    println!("根目录：{}", root().display());
     Ok(())
 }
 
@@ -870,40 +658,46 @@ fn cmd_config(
     set_hosts: Option<String>,
     set_days: Option<u64>,
     set_backoff: Option<String>,
+    set_retain_days: Option<u64>,
 ) -> Result<()> {
-    let mut cfg = load_config();
-    let mut changed = false;
+    let changing = set_hosts.is_some()
+        || set_days.is_some()
+        || set_backoff.is_some()
+        || set_retain_days.is_some();
+    // 要改配置时严格读取：文件写坏了就报错，不能拿默认值把它整个覆盖掉
+    let mut cfg = if changing {
+        state::read_config()?
+    } else {
+        load_config()
+    };
 
     if let Some(h) = set_hosts {
-        cfg.hosts = h
-            .split(',')
-            .map(|x| x.trim().to_string())
-            .filter(|x| !x.is_empty())
-            .collect();
-        changed = true;
+        cfg.hosts = parse_host_list(&h)?;
         println!("默认主机：{:?}", cfg.hosts);
     }
     if let Some(d) = set_days {
         cfg.days = d.max(1);
-        changed = true;
         println!("默认回溯天数：{}", cfg.days);
     }
     if let Some(b) = set_backoff {
         let parts: Vec<&str> = b.split(',').map(|x| x.trim()).collect();
         if parts.len() != 2 {
-            anyhow::bail!("格式应为 基础分钟,上限分钟，例如 15,360");
+            bail!("格式应为 基础分钟,上限分钟，例如 15,360");
         }
         let base: u64 = parts[0].parse()?;
         let max: u64 = parts[1].parse()?;
         if base == 0 || max < base {
-            anyhow::bail!("要求 基础 > 0 且 上限 >= 基础");
+            bail!("要求 基础 > 0 且 上限 >= 基础");
         }
         cfg.backoff_base_min = base;
         cfg.backoff_max_min = max;
-        changed = true;
         println!("退避：基础 {base} 分钟，上限 {max} 分钟");
     }
-    if changed {
+    if let Some(r) = set_retain_days {
+        cfg.retain_days = r;
+        println!("镜像保留天数：{r}（0 表示不清理）");
+    }
+    if changing {
         save_config(&cfg)?;
     }
 
@@ -915,6 +709,7 @@ fn cmd_config(
         "  backoff = 基础 {} 分钟 → 上限 {} 分钟",
         cfg.backoff_base_min, cfg.backoff_max_min
     );
+    println!("  retain_days = {}", cfg.retain_days);
     println!("  cc-switch 实际路径 = {}", cc_switch_bin());
     println!("  镜像根目录 = {}", root().display());
     let mut out = std::io::stdout();
@@ -927,75 +722,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn backoff_grows_and_caps() {
-        let cfg = Config::default(); // 基础 15 分钟，上限 360 分钟
-        assert_eq!(backoff_secs(&cfg, 1), 15 * 60);
-        assert_eq!(backoff_secs(&cfg, 2), 30 * 60);
-        assert_eq!(backoff_secs(&cfg, 3), 60 * 60);
-        assert_eq!(backoff_secs(&cfg, 4), 120 * 60);
-        assert_eq!(backoff_secs(&cfg, 5), 240 * 60);
-        assert_eq!(backoff_secs(&cfg, 6), 360 * 60);
-        assert_eq!(backoff_secs(&cfg, 60), 360 * 60, "不能超过上限");
-    }
-
-    #[test]
-    fn backoff_respects_config() {
-        let mut cfg = Config::default();
-        cfg.backoff_base_min = 1;
-        cfg.backoff_max_min = 5;
-        assert_eq!(backoff_secs(&cfg, 1), 60);
-        assert_eq!(backoff_secs(&cfg, 4), 5 * 60);
-    }
-
-    #[test]
     fn human_dur_formats() {
         assert_eq!(human_dur(60), "1 分钟");
         assert_eq!(human_dur(900), "15 分钟");
         assert_eq!(human_dur(3600), "1 小时");
         assert_eq!(human_dur(5400), "1 小时 30 分钟");
-    }
-
-    #[test]
-    fn cooling_window() {
-        let mut st = State::default();
-        st.hosts.insert(
-            "hot".into(),
-            HostState {
-                next_attempt: now_epoch() + 600,
-                ..Default::default()
-            },
-        );
-        st.hosts.insert(
-            "expired".into(),
-            HostState {
-                next_attempt: now_epoch() - 600,
-                ..Default::default()
-            },
-        );
-        assert!(cooling_until(&st, "hot").is_some());
-        assert!(cooling_until(&st, "expired").is_none());
-        assert!(cooling_until(&st, "never-seen").is_none());
-    }
-
-    #[test]
-    fn failure_accumulates_and_success_resets() {
-        let cfg = Config::default();
-        let mut st = State::default();
-
-        record_failure(&cfg, &mut st, "h", "Connection timed out\nsecond line");
-        assert_eq!(st.hosts["h"].failures, 1);
-        assert_eq!(st.hosts["h"].last_error, "Connection timed out");
-        assert!(st.hosts["h"].next_attempt > now_epoch());
-
-        record_failure(&cfg, &mut st, "h", "again");
-        assert_eq!(st.hosts["h"].failures, 2);
-
-        record_success(&mut st, "h", 12345, 7, 9);
-        assert_eq!(st.hosts["h"].failures, 0);
-        assert_eq!(st.hosts["h"].next_attempt, 0);
-        assert_eq!(st.hosts["h"].last_epoch, 12345);
-        assert_eq!(st.hosts["h"].last_imported, 7);
-        assert!(st.hosts["h"].last_error.is_empty());
-        assert!(cooling_until(&st, "h").is_none());
     }
 }

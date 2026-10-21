@@ -2,16 +2,24 @@
 //!
 //! 花费用 CC Switch 自己的 `model-pricing.json` 计价，口径与它的看板一致。
 
-use crate::{home, root};
+use crate::state::{home, root};
 use anyhow::Result;
 use chrono::{DateTime, Local, NaiveDate};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
+/// 每百万 Token 单价：(输入, 输出, 缓存读, 缓存写)
+type Price = (f64, f64, f64, f64);
+type Pricing = HashMap<String, Price>;
+
 #[derive(Debug, Clone)]
 struct Usage {
+    /// 去重键，同一次 API 响应只算一次：Claude 用 message.id（CC Switch 记作 `session:<id>`），
+    /// Codex 用 response_id。Claude Code 会把一次响应的每个内容块（thinking / text / tool_use）
+    /// 各写一行、usage 完全相同，不去重 Token 会算成 2~3 倍。没有 id 的记录不去重。
+    key: Option<String>,
     time: DateTime<Local>,
     model: String,
     input: i64,
@@ -32,7 +40,7 @@ struct Bucket {
 }
 
 impl Bucket {
-    fn add(&mut self, u: &Usage, price: Option<(f64, f64, f64, f64)>) {
+    fn add(&mut self, u: &Usage, price: Option<Price>) {
         self.req += 1;
         self.input += u.input;
         self.output += u.output;
@@ -72,7 +80,7 @@ impl Bucket {
 
 // ---------------------------------------------------------------- 定价
 
-fn load_pricing() -> HashMap<String, (f64, f64, f64, f64)> {
+fn load_pricing() -> Pricing {
     let path = home().join(".cc-switch").join("model-pricing.json");
     let mut out = HashMap::new();
     let Ok(text) = fs::read_to_string(path) else {
@@ -89,8 +97,7 @@ fn load_pricing() -> HashMap<String, (f64, f64, f64, f64)> {
             continue;
         };
         let f = |k: &str| {
-            m[k]
-                .as_str()
+            m[k].as_str()
                 .and_then(|s| s.parse::<f64>().ok())
                 .or_else(|| m[k].as_f64())
                 .unwrap_or(0.0)
@@ -108,10 +115,7 @@ fn load_pricing() -> HashMap<String, (f64, f64, f64, f64)> {
     out
 }
 
-fn price_for<'a>(
-    pricing: &'a HashMap<String, (f64, f64, f64, f64)>,
-    model: &str,
-) -> Option<(f64, f64, f64, f64)> {
+fn price_for(pricing: &Pricing, model: &str) -> Option<Price> {
     let m = model.trim().to_ascii_lowercase();
     if m.is_empty() {
         return None;
@@ -120,26 +124,24 @@ fn price_for<'a>(
         return Some(*p);
     }
     // 前缀匹配（模型名带日期/后缀时），取最长命中
-    let mut best: Option<(&String, &(f64, f64, f64, f64))> = None;
-    for (k, p) in pricing {
-        if k.len() >= 4 && m.starts_with(k) {
-            if best.map(|(bk, _)| k.len() > bk.len()).unwrap_or(true) {
-                best = Some((k, p));
-            }
-        }
-    }
-    best.map(|(_, p)| *p)
+    pricing
+        .iter()
+        .filter(|(k, _)| k.len() >= 4 && m.starts_with(k.as_str()))
+        .max_by_key(|(k, _)| k.len())
+        .map(|(_, p)| *p)
 }
 
 // ---------------------------------------------------------------- 扫描
 
+/// 递归收集 .jsonl（不跟随符号链接，避免链接成环时无限递归）。
 fn collect_jsonl(dir: &Path, out: &mut Vec<PathBuf>) {
     let Ok(rd) = fs::read_dir(dir) else { return };
     for e in rd.flatten() {
+        let Ok(ft) = e.file_type() else { continue };
         let p = e.path();
-        if p.is_dir() {
+        if ft.is_dir() {
             collect_jsonl(&p, out);
-        } else if p.extension().map(|x| x == "jsonl").unwrap_or(false) {
+        } else if ft.is_file() && p.extension().is_some_and(|x| x == "jsonl") {
             out.push(p);
         }
     }
@@ -171,10 +173,19 @@ fn scan_codex(path: &Path, out: &mut Vec<Usage>) {
                 let Some(ts) = v["timestamp"].as_str().and_then(parse_ts) else {
                     continue;
                 };
-                let u = &v["payload"]["usage"];
+                let payload = &v["payload"];
+                let u = &payload["usage"];
                 let input = u["input_tokens"].as_i64().unwrap_or(0);
                 let cached = u["cached_input_tokens"].as_i64().unwrap_or(0);
+                let key = payload["response_id"]
+                    .as_str()
+                    .map(|r| format!("codex:{r}"))
+                    .or_else(|| {
+                        let thread = payload["thread_id"].as_str()?;
+                        Some(format!("codex:{thread}:{}", v["ordinal"].as_i64()?))
+                    });
                 out.push(Usage {
+                    key,
                     time: ts,
                     model: model.clone().unwrap_or_else(|| "unknown".into()),
                     input: (input - cached).max(0),
@@ -207,7 +218,12 @@ fn scan_claude(path: &Path, out: &mut Vec<Usage>) {
         if !u.is_object() {
             continue;
         }
+        let key = v["message"]["id"]
+            .as_str()
+            .or_else(|| v["requestId"].as_str())
+            .map(|id| format!("claude:{id}"));
         out.push(Usage {
+            key,
             time: ts,
             model: v["message"]["model"]
                 .as_str()
@@ -233,7 +249,51 @@ struct HostReport {
     by_day: BTreeMap<NaiveDate, Bucket>,
 }
 
-pub fn run(days: i64, only_host: Option<&str>, daily: bool, json: bool) -> Result<()> {
+/// 把一台主机的记录计入报告。`seen` 跨主机共享：同一次响应出现在多个镜像里
+/// （几个别名指向同一台机器）时只算给排在前面的主机，合计不会翻倍。
+fn tally(
+    rep: &mut HostReport,
+    usages: &[Usage],
+    seen: &mut HashSet<String>,
+    (since, today): (NaiveDate, NaiveDate),
+    pricing: &Pricing,
+) {
+    for u in usages {
+        let d = u.time.date_naive();
+        if d < since {
+            continue;
+        }
+        if let Some(k) = &u.key {
+            if !seen.insert(k.clone()) {
+                continue;
+            }
+        }
+        let price = price_for(pricing, &u.model);
+        rep.window.add(u, price);
+        rep.by_model
+            .entry(u.model.clone())
+            .or_default()
+            .1
+            .add(u, price);
+        rep.by_day.entry(d).or_default().add(u, price);
+        if d == today {
+            rep.today.add(u, price);
+            rep.by_model
+                .entry(u.model.clone())
+                .or_default()
+                .0
+                .add(u, price);
+        }
+    }
+}
+
+pub fn run(
+    days: i64,
+    only_host: Option<&str>,
+    daily: bool,
+    json: bool,
+    retain_days: u64,
+) -> Result<()> {
     let days = days.max(1);
     let now = Local::now();
     let today: NaiveDate = now.date_naive();
@@ -265,55 +325,46 @@ pub fn run(days: i64, only_host: Option<&str>, daily: bool, json: bool) -> Resul
 
     let pricing = load_pricing();
     let mut reports: Vec<HostReport> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
 
     for host in &hosts {
-        let mut files = Vec::new();
-        collect_jsonl(&base.join(host).join("codex").join("sessions"), &mut files);
-        collect_jsonl(&base.join(host).join("claude").join("projects"), &mut files);
+        // 按目录决定解析器（不能看路径里有没有 "/claude/"：主机名或根目录本身可能就叫 claude）
+        let mut codex_files = Vec::new();
+        let mut claude_files = Vec::new();
+        collect_jsonl(
+            &base.join(host).join("codex").join("sessions"),
+            &mut codex_files,
+        );
+        collect_jsonl(
+            &base.join(host).join("claude").join("projects"),
+            &mut claude_files,
+        );
 
         let mut usages = Vec::new();
-        for f in &files {
-            if f.to_string_lossy().contains("/claude/") {
-                scan_claude(f, &mut usages);
-            } else {
-                scan_codex(f, &mut usages);
-            }
+        for f in &codex_files {
+            scan_codex(f, &mut usages);
+        }
+        for f in &claude_files {
+            scan_claude(f, &mut usages);
         }
 
         let mut rep = HostReport {
             host: host.clone(),
-            files: files.len(),
+            files: codex_files.len() + claude_files.len(),
             ..Default::default()
         };
-        for u in &usages {
-            let d = u.time.date_naive();
-            if d < since {
-                continue;
-            }
-            let price = price_for(&pricing, &u.model);
-            rep.window.add(u, price);
-            rep.by_model.entry(u.model.clone()).or_default().1.add(u, price);
-            rep.by_day.entry(d).or_default().add(u, price);
-            if d == today {
-                rep.today.add(u, price);
-                rep.by_model.entry(u.model.clone()).or_default().0.add(u, price);
-            }
-        }
+        tally(&mut rep, &usages, &mut seen, (since, today), &pricing);
         reports.push(rep);
     }
 
     if json {
-        return print_json(&reports, days, today, daily);
+        return print_json(&reports, days, today, daily, retain_days);
     }
 
     let mut total_today = Bucket::default();
     for r in &reports {
         total_today.merge(&r.today);
-        println!(
-            "\n### {}  (镜像 {} 个日志)",
-            r.host,
-            r.files
-        );
+        println!("\n### {}  (镜像 {} 个日志)", r.host, r.files);
         if r.files == 0 {
             println!("  暂无镜像日志");
             continue;
@@ -391,7 +442,10 @@ pub fn run(days: i64, only_host: Option<&str>, daily: bool, json: bool) -> Resul
 
         if daily {
             println!("\n  逐日：");
-            println!("  {:<14}{:>8}{:>14}{:>12}{:>12}", "日期", "次数", "输入", "输出", "花费$");
+            println!(
+                "  {:<14}{:>8}{:>14}{:>12}{:>12}",
+                "日期", "次数", "输入", "输出", "花费$"
+            );
             for (d, b) in &r.by_day {
                 println!(
                     "  {:<14}{:>8}{:>14}{:>12}{:>12}",
@@ -415,10 +469,22 @@ pub fn run(days: i64, only_host: Option<&str>, daily: bool, json: bool) -> Resul
         total_today.cost_str()
     );
     println!("\n注意：花费按 CC Switch 的 model_pricing 折算，不等同于中转站账单。");
+    if retain_days > 0 && days as u64 > retain_days {
+        println!(
+            "注意：镜像只保留最近 {retain_days} 天改动过的日志，{days} 天窗口里更早的记录可能不全\
+             （调整：ccr config --set-retain-days <天数>）。"
+        );
+    }
     Ok(())
 }
 
-fn print_json(reports: &[HostReport], days: i64, today: NaiveDate, daily: bool) -> Result<()> {
+fn print_json(
+    reports: &[HostReport],
+    days: i64,
+    today: NaiveDate,
+    daily: bool,
+    retain_days: u64,
+) -> Result<()> {
     let mut total = Bucket::default();
     let hosts: Vec<serde_json::Value> = reports
         .iter()
@@ -467,6 +533,7 @@ fn print_json(reports: &[HostReport], days: i64, today: NaiveDate, daily: bool) 
         "generated_at": Local::now().to_rfc3339(),
         "today": today.format("%Y-%m-%d").to_string(),
         "days": days,
+        "mirror_retain_days": retain_days,
         "hosts": hosts,
         "today_total": {"requests": total.req, "input_tokens": total.input,
                         "output_tokens": total.output, "cache_read_tokens": total.cache_read,
@@ -486,11 +553,10 @@ pub fn dir_size(dir: &Path) -> u64 {
     let Ok(rd) = fs::read_dir(dir) else { return 0 };
     let mut total = 0u64;
     for e in rd.flatten() {
-        let p = e.path();
-        if p.is_dir() {
-            total += dir_size(&p);
-        } else if let Ok(m) = e.metadata() {
-            total += m.len();
+        match e.file_type() {
+            Ok(t) if t.is_dir() => total += dir_size(&e.path()),
+            Ok(t) if t.is_file() => total += e.metadata().map(|m| m.len()).unwrap_or(0),
+            _ => {}
         }
     }
     total
@@ -515,7 +581,7 @@ fn thousands(n: i64) -> String {
     let s = n.abs().to_string();
     let mut out = String::new();
     for (i, c) in s.chars().enumerate() {
-        if i > 0 && (s.len() - i) % 3 == 0 {
+        if i > 0 && (s.len() - i).is_multiple_of(3) {
             out.push(',');
         }
         out.push(c);
@@ -564,10 +630,108 @@ mod tests {
         assert_eq!(price_for(&p, ""), None);
     }
 
+    /// 真实 Claude Code 日志的形状：一次响应拆成 thinking / text / tool_use 三行，usage 相同
+    const CLAUDE_LOG: &str = r#"{"type":"user","timestamp":"2026-10-21T03:50:00Z","message":{"role":"user"}}
+{"type":"assistant","timestamp":"2026-10-21T03:50:11Z","message":{"id":"msg_a","model":"claude-x","content":[{"type":"thinking"}],"usage":{"input_tokens":100,"output_tokens":10,"cache_read_input_tokens":5,"cache_creation_input_tokens":0}}}
+{"type":"assistant","timestamp":"2026-10-21T03:50:12Z","message":{"id":"msg_a","model":"claude-x","content":[{"type":"text"}],"usage":{"input_tokens":100,"output_tokens":10,"cache_read_input_tokens":5,"cache_creation_input_tokens":0}}}
+{"type":"assistant","timestamp":"2026-10-21T03:50:13Z","message":{"id":"msg_a","model":"claude-x","content":[{"type":"tool_use"}],"usage":{"input_tokens":100,"output_tokens":10,"cache_read_input_tokens":5,"cache_creation_input_tokens":0}}}
+{"type":"assistant","timestamp":"2026-10-21T03:51:00Z","message":{"id":"msg_b","model":"claude-x","content":[{"type":"text"}],"usage":{"input_tokens":7,"output_tokens":3,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}
+"#;
+
+    const CODEX_LOG: &str = r#"{"timestamp":"2026-10-21T04:00:00Z","type":"turn_context","payload":{"model":"gpt-x"}}
+{"timestamp":"2026-10-21T04:00:01Z","ordinal":20,"type":"token_usage_record","payload":{"thread_id":"t1","response_id":"resp_1","usage":{"input_tokens":1000,"cached_input_tokens":800,"cache_write_input_tokens":0,"output_tokens":50}}}
+{"timestamp":"2026-10-21T04:00:02Z","ordinal":21,"type":"token_usage_record","payload":{"thread_id":"t1","usage":{"input_tokens":10,"cached_input_tokens":0,"output_tokens":1}}}
+"#;
+
+    fn scan_text(name: &str, text: &str, scan: fn(&Path, &mut Vec<Usage>)) -> Vec<Usage> {
+        let d = crate::state::tests::scratch(name);
+        let f = d.join("log.jsonl");
+        fs::write(&f, text).unwrap();
+        let mut out = Vec::new();
+        scan(&f, &mut out);
+        out
+    }
+
+    fn window_of(usages: &[Usage]) -> (NaiveDate, NaiveDate) {
+        let d = usages[0].time.date_naive();
+        (d - chrono::Duration::days(1), d)
+    }
+
+    #[test]
+    fn claude_content_blocks_count_as_one_request() {
+        let usages = scan_text("claude-dedupe", CLAUDE_LOG, scan_claude);
+        assert_eq!(usages.len(), 4, "扫描阶段保留每一行，去重在汇总时做");
+
+        let mut rep = HostReport::default();
+        tally(
+            &mut rep,
+            &usages,
+            &mut HashSet::new(),
+            window_of(&usages),
+            &Pricing::new(),
+        );
+
+        assert_eq!(rep.window.req, 2, "msg_a 的三个内容块只算一次请求");
+        assert_eq!(rep.window.input, 107);
+        assert_eq!(rep.window.output, 13);
+        assert_eq!(rep.window.cache_read, 5);
+    }
+
+    #[test]
+    fn codex_records_carry_model_keys_and_cache_split() {
+        let usages = scan_text("codex-scan", CODEX_LOG, scan_codex);
+        assert_eq!(usages.len(), 2);
+        assert_eq!(usages[0].model, "gpt-x", "模型来自前面的 turn_context");
+        assert_eq!(usages[0].key.as_deref(), Some("codex:resp_1"));
+        assert_eq!(
+            usages[1].key.as_deref(),
+            Some("codex:t1:21"),
+            "没有 response_id 时退回 线程+序号"
+        );
+        assert_eq!(
+            (usages[0].input, usages[0].cache_read),
+            (200, 800),
+            "输入里扣掉缓存命中部分"
+        );
+    }
+
+    #[test]
+    fn same_log_mirrored_under_two_aliases_is_counted_once() {
+        let usages = scan_text("codex-alias", CODEX_LOG, scan_codex);
+        let window = window_of(&usages);
+        let mut seen = HashSet::new();
+        let (mut first, mut alias) = (HostReport::default(), HostReport::default());
+
+        tally(&mut first, &usages, &mut seen, window, &Pricing::new());
+        tally(&mut alias, &usages, &mut seen, window, &Pricing::new());
+
+        assert_eq!(first.window.req, 2);
+        assert_eq!(alias.window.req, 0, "同一份日志的第二个镜像不再计数");
+    }
+
+    #[test]
+    fn records_without_ids_are_never_merged() {
+        let mut usages = scan_text("codex-noid", CODEX_LOG, scan_codex);
+        for u in &mut usages {
+            u.key = None;
+        }
+        let mut rep = HostReport::default();
+        let doubled: Vec<Usage> = usages.iter().chain(usages.iter()).cloned().collect();
+        tally(
+            &mut rep,
+            &doubled,
+            &mut HashSet::new(),
+            window_of(&usages),
+            &Pricing::new(),
+        );
+        assert_eq!(rep.window.req, 4);
+    }
+
     #[test]
     fn bucket_cost_math() {
         let mut b = Bucket::default();
         let u = Usage {
+            key: None,
             time: Local::now(),
             model: "m".into(),
             input: 1_000_000,
@@ -585,6 +749,7 @@ mod tests {
     fn bucket_marks_unpriced() {
         let mut b = Bucket::default();
         let u = Usage {
+            key: None,
             time: Local::now(),
             model: "nope".into(),
             input: 10,

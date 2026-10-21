@@ -1,6 +1,6 @@
 //! launchd 定时任务管理（macOS）。
 
-use crate::root;
+use crate::state::{home, root};
 use anyhow::{bail, Context, Result};
 use std::fs;
 use std::path::PathBuf;
@@ -10,7 +10,7 @@ const LABEL: &str = "com.fwmbam4.ccr-sync";
 const LEGACY_LABEL: &str = "com.fwmbam4.ccswitch-remote-usage";
 
 fn plist_path() -> PathBuf {
-    crate::home()
+    home()
         .join("Library")
         .join("LaunchAgents")
         .join(format!("{LABEL}.plist"))
@@ -34,18 +34,27 @@ fn exe_path() -> Result<PathBuf> {
     std::env::current_exe().context("无法确定 ccr 自身路径")
 }
 
+/// plist 是 XML：主机名、路径里出现 `&` `<` 之类字符时必须转义，否则 launchctl 拒绝加载
+fn xml_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
+}
+
 pub fn install(interval: u64, hosts: &[String]) -> Result<()> {
     let exe = exe_path()?;
     let dir = root();
     fs::create_dir_all(&dir)?;
-    fs::create_dir_all(crate::home().join("Library").join("LaunchAgents"))?;
+    fs::create_dir_all(home().join("Library").join("LaunchAgents"))?;
 
     let hosts_env = if hosts.is_empty() {
         String::new()
     } else {
         format!(
             "        <key>REMOTE_USAGE_HOSTS</key>\n        <string>{}</string>\n",
-            hosts.join(" ")
+            xml_escape(&hosts.join(" "))
         )
     };
 
@@ -85,11 +94,11 @@ pub fn install(interval: u64, hosts: &[String]) -> Result<()> {
 </plist>
 "#,
         label = LABEL,
-        exe = exe.display(),
+        exe = xml_escape(&exe.display().to_string()),
         hosts = hosts_env,
         interval = interval.max(60),
-        out = dir.join("launchd.out.log").display(),
-        err = dir.join("launchd.err.log").display(),
+        out = xml_escape(&dir.join("launchd.out.log").display().to_string()),
+        err = xml_escape(&dir.join("launchd.err.log").display().to_string()),
     );
 
     // 清掉旧的任务（包括之前 bash 版的）
@@ -98,7 +107,7 @@ pub fn install(interval: u64, hosts: &[String]) -> Result<()> {
             .args(["bootout", &format!("{}/{}", target(), label)])
             .output();
     }
-    let legacy = crate::home()
+    let legacy = home()
         .join("Library")
         .join("LaunchAgents")
         .join(format!("{LEGACY_LABEL}.plist"));
@@ -168,4 +177,18 @@ pub fn status() -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn plist_values_are_xml_escaped() {
+        assert_eq!(
+            xml_escape("a&b <c> \"d\" 'e'"),
+            "a&amp;b &lt;c&gt; &quot;d&quot; &apos;e&apos;"
+        );
+        assert_eq!(xml_escape("netcup nuyek-yeats"), "netcup nuyek-yeats");
+    }
 }
