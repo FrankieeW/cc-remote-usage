@@ -26,8 +26,10 @@ ccr --version
 
 ```bash
 cargo build --release --offline   # 离线；去掉 --offline 也可
-cp target/release/ccr /opt/homebrew/bin/ccr
+./target/release/ccr --help
 ```
+
+npm 安装的 `/opt/homebrew/bin/ccr` 是 Node shim 的符号链接，不要用 `cp` 覆盖它。
 
 ## 用法
 
@@ -40,6 +42,7 @@ ccr sync netcup           # 指定主机（点名的机器不受冷却限制）
 ccr sync --all --quiet    # 全自动（定时任务用：只挑可达且有日志的主机）
 ccr sync --retry-now      # 立刻重试冷却中的机器，仍走增量
 ccr sync --all --force    # 无视冷却 + 忽略断点全量重拉
+ccr import netcup         # 只重试已有镜像的导入，不连接远端、不推进拉取断点
 ccr report --days 7       # 按服务器 / 模型汇总 Token 与折算花费
 ccr report --days 7 --daily   # 加逐日明细
 ccr report --json         # 机器可读
@@ -51,7 +54,47 @@ ccr config --set-hosts netcup,frankie-vps   # 固定默认主机（不再交互�
 ccr config --set-days 3                     # 首次回溯天数
 ccr config --set-backoff 15,360             # 退避：基础 15 分钟，上限 6 小时
 ccr config --set-retain-days 7              # 镜像保留天数（0 = 不清理）
+ccr config --pin-cc-switch                 # 锁定当前安装的 CLI 版本
+ccr config --unpin-cc-switch               # 取消版本锁定
 ```
+
+## 额外 Codex 日志目录（显式配置）
+
+默认只扫描 SSH 登录用户的 `~/.codex/sessions` 和 `~/.claude/projects`。
+Pharos 等编排器的 main、worker、verifier、subagent 可能分别使用自己的 `CODEX_HOME`，
+需要用户指定这些会话所在的远端绝对路径；ccr 不会自动搜索项目或整台服务器。
+
+```bash
+ccr config --add-codex-root 'server=/srv/pharos/runtime/projects'
+ccr sync server
+ccr config --clear-codex-roots server
+```
+
+`--add-codex-root` 可重复指定。ccr 只拉取配置范围内 `sessions/` 和 `archived_sessions/`
+下面的 `.jsonl`，不复制 `auth.json` 或 `config.toml`；跳过下级 `materials`、`.git`、
+`.venv`、`node_modules`，避免把材料中的历史副本当作当前 actor 日志。需要同步这些目录时，
+可以显式配置其中的会话目录本身。
+
+新增或更改目录列表后，下一次同步会先完整回补这些目录，再恢复增量同步；导入失败不会
+把回补标成完成。不同来源的同名文件分开保存，并整理到 CC Switch 能扫描到的目录深度。
+有额外目录配置的主机也会参与 `sync --all`，默认目录没有近期日志时不会被跳过；
+`hosts --probe` 的文件数仍只统计默认目录，额外目录会单独标注。
+
+## 导入器版本与失败重试
+
+先确认桌面版与 CLI 兼容，再执行 `ccr config --pin-cc-switch`。锁定记录在配置的
+`cc_switch_version` 中；每轮同步在探测 SSH、拉取日志之前检查 CLI 版本，并固定本轮
+执行的二进制路径。版本不一致会停止，确认新版本兼容后可重新锁定。版本锁定防止后续
+CLI 意外升级，不会自动判断桌面版与数据库是否兼容。
+
+日志已拉取、但导入失败时可运行 `ccr import <主机...>`，直接重试本地镜像。
+它沿用同步锁、清除成功主机的失败状态，但保持 `last_epoch` 不变；下次正常同步仍会补齐
+远端新增日志。普通同步及本地导入只要有一台失败，都返回非零退出码，`--quiet` 也一样。
+配置文件解析失败时停止操作，防止绕过版本锁定。
+
+首次同步默认只回溯两天，之后的增量不会补回更早且未修改的文件。
+需要完整历史时显式运行 `ccr sync <主机> --force`；历史用量由 CC Switch 去重，
+成功导入后仍会按镜像保留期清理本地旧文件。
 
 ## 失败退避（超时不反复赔）
 
@@ -99,7 +142,7 @@ ccr config --set-retain-days 7              # 镜像保留天数（0 = 不清理
 - **去重**：CC Switch 自己按 `session_log_sync` 的 byte offset 去重，重复导入无副作用。
 - **别名去重**：几个别名指向同一台机器（如 `macmini` / `macmini-lan` / `macmini-tailscale`）时，
   探测阶段按会话文件指纹识别，只同步一次；指向本机的别名直接跳过。
-- **不会撞车**：同一时刻只跑一个 `ccr sync`（`sync.lock`），定时任务碰上手动同步会自动跳过本轮；
+- **不会撞车**：`ccr sync` 与 `ccr import` 共用 `sync.lock`，定时任务碰上手动操作会自动跳过本轮；
   交互多选等待期间不占锁。卡死的远端不会一直占着锁：单台探测 2 分钟、单个目录传输 60 分钟、
   一次 cc-switch 导入 15 分钟，超时即中止（下轮重试）。
 
@@ -109,7 +152,7 @@ ccr config --set-retain-days 7              # 镜像保留天数（0 = 不清理
 |---|---|
 | `~/.cc-switch/remote-usage/<host>/` | 会话日志镜像（自动清理 7 天未更新的文件，`retain_days` 可调） |
 | `~/.cc-switch/remote-usage/state.json` | 每台主机的增量断点与上次结果 |
-| `~/.cc-switch/remote-usage/config.json` | 默认主机、回溯天数、退避、保留天数、cc-switch 路径 |
+| `~/.cc-switch/remote-usage/config.json` | 默认主机、额外 Codex 目录、回溯天数、退避、保留天数、CLI 路径和版本锁定 |
 | `~/.cc-switch/remote-usage/sync.lock` | 运行锁（防止两个同步同时跑） |
 | `~/Library/LaunchAgents/com.fwmbam4.ccr-sync.plist` | 定时任务（`ccr daemon install` 生成） |
 | `~/.cc-switch/remote-usage/launchd.err.log` | 定时任务日志 |
@@ -120,7 +163,7 @@ ccr config --set-retain-days 7              # 镜像保留天数（0 = 不清理
 - SSH 免密（公钥）可用，`BatchMode=yes` 下能跑
 - ssh config 里给交互登录配的 `RemoteCommand` / `RequestTTY` 不影响（ccr 用 `-T -o RemoteCommand=none` 覆盖）
 - 登录 shell 不限：远端脚本经 `sh -s` 从 stdin 执行，fish / csh 也没问题；会话目录是符号链接也行
-- agent 日志在默认位置：`~/.codex/sessions`、`~/.claude/projects`
+- agent 日志在默认位置，或显式配置额外 Codex 日志目录
 
 ## 注意
 

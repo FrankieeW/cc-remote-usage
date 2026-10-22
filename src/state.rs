@@ -17,6 +17,11 @@ pub struct Config {
     /// cc-switch 可执行文件路径，留空自动探测
     #[serde(default)]
     pub cc_switch: Option<String>,
+    /// 经用户确认与桌面版兼容的 CLI 版本；为空时不锁定。
+    #[serde(default)]
+    pub cc_switch_version: Option<String>,
+    #[serde(default)]
+    pub extra_codex_roots: BTreeMap<String, Vec<String>>,
     /// 连续失败后的基础冷却（分钟），默认 15
     #[serde(default = "default_backoff_base")]
     pub backoff_base_min: u64,
@@ -44,12 +49,22 @@ fn default_retain_days() -> u64 {
     7
 }
 
+impl Config {
+    pub fn has_extra_codex_roots(&self, host: &str) -> bool {
+        self.extra_codex_roots
+            .get(host)
+            .is_some_and(|roots| !roots.is_empty())
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
             hosts: Vec::new(),
             days: default_days(),
             cc_switch: None,
+            cc_switch_version: None,
+            extra_codex_roots: BTreeMap::new(),
             backoff_base_min: default_backoff_base(),
             backoff_max_min: default_backoff_max(),
             retain_days: default_retain_days(),
@@ -231,7 +246,7 @@ fn read_json_or_default<T: Default + for<'de> Deserialize<'de>>(path: &Path) -> 
 }
 
 /// 先写临时文件再 rename：进程中途被杀也不会留下半截 JSON。
-fn write_atomic(path: &Path, data: &[u8]) -> Result<()> {
+pub(crate) fn write_atomic(path: &Path, data: &[u8]) -> Result<()> {
     let dir = path.parent().context("目标路径没有父目录")?;
     fs::create_dir_all(dir)?;
     let name = path.file_name().context("目标路径没有文件名")?;
@@ -283,9 +298,13 @@ fn try_lock_at(path: &Path) -> Result<Option<fs::File>> {
 
 /// 解析 cc-switch 可执行文件：配置 > PATH > 常见 Homebrew 路径
 pub fn cc_switch_bin() -> String {
-    if let Some(p) = load_config().cc_switch {
+    cc_switch_bin_for(&load_config())
+}
+
+pub fn cc_switch_bin_for(cfg: &Config) -> String {
+    if let Some(p) = &cfg.cc_switch {
         if !p.is_empty() {
-            return p;
+            return p.clone();
         }
     }
     if let Some(p) = which("cc-switch") {

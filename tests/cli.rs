@@ -39,7 +39,15 @@ printf '%s\n' "$script" | HOME="$FAKE_REMOTES/$home" "$@"
 
 /// 假 cc-switch：记录作用域环境变量与参数，回一份 CC Switch 5.x 形状的 JSON。
 const FAKE_CC_SWITCH: &str = r#"#!/bin/sh
+if [ "$1" = --version ]; then
+  printf 'cc-switch %s\n' "${FAKE_CC_VERSION:-5.11.3}"
+  exit 0
+fi
 echo "cc-switch CODEX_HOME=$CODEX_HOME CLAUDE_CONFIG_DIR=$CLAUDE_CONFIG_DIR $*" >> "$FAKE_LOG"
+if [ "${FAKE_CC_FAIL_IMPORT:-}" = 1 ]; then
+  echo 'database unavailable' >&2
+  exit 1
+fi
 echo '{"imported":1,"skipped":0,"filesScanned":1,"suspectedDuplicates":0,"deferredFiles":0,"errors":[]}'
 "#;
 
@@ -154,7 +162,7 @@ fn sync_pulls_imports_per_app_prunes_and_records_failures() {
     touch(&stale, DAY * 30);
 
     let out = sb.ccr(&["sync", "alpha", "deadbox"], &[]);
-    assert!(out.status.success(), "{}", text(&out));
+    assert!(!out.status.success(), "部分同步失败必须返回非零退出码");
 
     let mirror = sb.root().join("alpha");
     assert!(mirror
@@ -274,9 +282,238 @@ fn broken_config_never_triggers_pruning() {
 
     let out = sb.ccr(&["sync", "alpha"], &[]);
 
-    assert!(out.status.success(), "{}", text(&out));
+    assert!(!out.status.success(), "损坏的配置不能绕过版本锁定");
     assert!(text(&out).contains("解析失败"));
     assert!(stale.exists(), "配置读不出来时不能按默认值删文件");
+    assert!(sb.calls().is_empty());
+}
+
+#[test]
+fn pinned_importer_is_checked_before_discovering_hosts() {
+    let sb = Sandbox::new("version-preflight");
+    sb.ssh_config("Host deadbox\n  HostName 10.0.0.1\n");
+    fs::write(
+        sb.root().join("config.json"),
+        r#"{"cc_switch_version":"5.11.3"}"#,
+    )
+    .unwrap();
+
+    let out = sb.ccr(&["sync", "--all"], &[("FAKE_CC_VERSION", "5.12.0")]);
+
+    assert!(!out.status.success());
+    assert!(sb.calls().is_empty(), "版本不匹配时不能探测 SSH 或导入");
+    assert!(!sb.root().join("state.json").exists());
+}
+
+#[test]
+fn config_pins_installed_importer_and_can_unpin_it() {
+    let sb = Sandbox::new("pin-config");
+
+    let pinned = sb.ccr(&["config", "--pin-cc-switch"], &[]);
+
+    assert!(pinned.status.success(), "{}", text(&pinned));
+    let config: Value =
+        serde_json::from_str(&fs::read_to_string(sb.root().join("config.json")).unwrap()).unwrap();
+    assert_eq!(config["cc_switch_version"], "5.11.3");
+
+    let unpinned = sb.ccr(&["config", "--unpin-cc-switch"], &[]);
+
+    assert!(unpinned.status.success(), "{}", text(&unpinned));
+    let config: Value =
+        serde_json::from_str(&fs::read_to_string(sb.root().join("config.json")).unwrap()).unwrap();
+    assert!(config["cc_switch_version"].is_null());
+}
+
+#[test]
+fn local_import_retries_without_ssh_or_advancing_the_pull_checkpoint() {
+    let sb = Sandbox::new("local-import");
+    seed_remote(&sb, "alpha");
+    let synced = sb.ccr(&["sync", "alpha"], &[]);
+    assert!(synced.status.success(), "{}", text(&synced));
+    let checkpoint = sb.state()["hosts"]["alpha"]["last_epoch"].clone();
+    let previous_calls = sb.calls().len();
+
+    let failed = sb.ccr(&["import", "alpha"], &[("FAKE_CC_FAIL_IMPORT", "1")]);
+
+    assert!(!failed.status.success());
+    assert_eq!(sb.state()["hosts"]["alpha"]["failures"], 1);
+    assert_eq!(sb.state()["hosts"]["alpha"]["last_epoch"], checkpoint);
+
+    let imported = sb.ccr(&["import", "alpha"], &[]);
+
+    assert!(imported.status.success(), "{}", text(&imported));
+    let state = sb.state();
+    assert_eq!(state["hosts"]["alpha"]["last_epoch"], checkpoint);
+    assert_eq!(state["hosts"]["alpha"]["failures"], 0);
+    assert_eq!(state["hosts"]["alpha"]["next_attempt"], 0);
+    assert_eq!(state["hosts"]["alpha"]["last_imported"], 2);
+    assert!(!sb.calls()[previous_calls..].contains("ssh "));
+}
+
+#[test]
+fn local_import_requires_mirrors_and_does_not_invent_a_pull_checkpoint() {
+    let sb = Sandbox::new("local-import-new");
+    touch(
+        &sb.root().join("alpha/codex/sessions/session.jsonl"),
+        DAY / 24,
+    );
+
+    let out = sb.ccr(&["import", "alpha", "missing"], &[]);
+
+    assert!(!out.status.success());
+    let state = sb.state();
+    assert_eq!(state["hosts"]["alpha"]["last_epoch"], 0);
+    assert_eq!(state["hosts"]["alpha"]["last_imported"], 2);
+    assert_eq!(state["hosts"]["missing"]["failures"], 1);
+    assert!(!sb.calls().contains("ssh "));
+}
+
+#[test]
+fn quiet_sync_reports_import_failures_with_nonzero_exit() {
+    let sb = Sandbox::new("quiet-import-failure");
+    seed_remote(&sb, "alpha");
+
+    let out = sb.ccr(
+        &["sync", "alpha", "--quiet"],
+        &[("FAKE_CC_FAIL_IMPORT", "1")],
+    );
+
+    assert!(!out.status.success(), "定时任务必须能观察到导入失败");
+    assert_eq!(sb.state()["hosts"]["alpha"]["last_epoch"], 0);
+    assert_eq!(sb.state()["hosts"]["alpha"]["failures"], 1);
+}
+
+fn mirrored_jsonl(dir: &Path) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    for entry in fs::read_dir(dir).unwrap() {
+        let entry = entry.unwrap();
+        if entry.file_type().unwrap().is_dir() {
+            paths.extend(mirrored_jsonl(&entry.path()));
+        } else if entry.path().extension().is_some_and(|ext| ext == "jsonl") {
+            paths.push(entry.path());
+        }
+    }
+    paths
+}
+
+#[test]
+fn extra_codex_roots_require_configuration_and_backfill_old_actor_logs() {
+    let sb = Sandbox::new("extra-roots");
+    seed_remote(&sb, "alpha");
+    let extra = sb.remote("alpha").join("Pharos 'test'/runtime/projects");
+    for actor in ["main", "workers/worker1"] {
+        touch(
+            &extra
+                .join(actor)
+                .join(".codex-home/sessions/2026/10/01/same-name.jsonl"),
+            DAY * 5,
+        );
+    }
+    touch(
+        &extra.join("materials/copy/.codex-home/sessions/copied.jsonl"),
+        DAY / 24,
+    );
+    fs::write(
+        extra.join("main/.codex-home/auth.json"),
+        "private authentication",
+    )
+    .unwrap();
+    let first = sb.ccr(&["sync", "alpha"], &[]);
+    assert!(first.status.success(), "{}", text(&first));
+    let mirror = sb.root().join("alpha/codex/sessions");
+    assert_eq!(mirrored_jsonl(&mirror).len(), 1);
+
+    let configured = sb.ccr(
+        &[
+            "config",
+            "--add-codex-root",
+            &format!("alpha={}", extra.display()),
+        ],
+        &[],
+    );
+    assert!(configured.status.success(), "{}", text(&configured));
+    let synced = sb.ccr(&["sync", "alpha"], &[]);
+
+    assert!(synced.status.success(), "{}", text(&synced));
+    let files = mirrored_jsonl(&mirror);
+    let extra_files: Vec<_> = files
+        .iter()
+        .filter(|p| p.file_name().unwrap() == "same-name.jsonl")
+        .collect();
+    assert_eq!(extra_files.len(), 2, "不同 actor 的同名日志都必须保留");
+    assert_ne!(extra_files[0].parent(), extra_files[1].parent());
+    for p in extra_files {
+        assert!(
+            p.strip_prefix(&mirror).unwrap().components().count() <= 4,
+            "导入器只扫描三层子目录"
+        );
+    }
+    assert!(!files
+        .iter()
+        .any(|p| p.file_name().unwrap() == "copied.jsonl"));
+    assert!(!mirror.join("auth.json").exists());
+}
+
+#[test]
+fn failed_extra_root_import_keeps_the_initial_backfill_pending() {
+    let sb = Sandbox::new("extra-root-retry");
+    seed_remote(&sb, "alpha");
+    assert!(sb.ccr(&["sync", "alpha"], &[]).status.success());
+    let checkpoint = sb.state()["hosts"]["alpha"]["last_epoch"].clone();
+    let extra = sb.remote("alpha").join("orchestration");
+    touch(&extra.join("one/.codex-home/sessions/first.jsonl"), DAY * 5);
+    assert!(sb
+        .ccr(
+            &[
+                "config",
+                "--add-codex-root",
+                &format!("alpha={}", extra.display())
+            ],
+            &[],
+        )
+        .status
+        .success());
+
+    let failed = sb.ccr(&["sync", "alpha"], &[("FAKE_CC_FAIL_IMPORT", "1")]);
+    assert!(!failed.status.success());
+    assert_eq!(sb.state()["hosts"]["alpha"]["last_epoch"], checkpoint);
+    touch(
+        &extra.join("two/.codex-home/sessions/second.jsonl"),
+        DAY * 5,
+    );
+    let retried = sb.ccr(&["sync", "alpha"], &[]);
+
+    assert!(retried.status.success(), "{}", text(&retried));
+    let files = mirrored_jsonl(&sb.root().join("alpha/codex/sessions"));
+    assert!(files
+        .iter()
+        .any(|p| p.file_name().unwrap() == "second.jsonl"));
+}
+
+#[test]
+fn configured_extra_only_host_is_included_in_automatic_sync() {
+    let sb = Sandbox::new("extra-only-auto");
+    let extra = sb.remote("alpha").join("research");
+    touch(
+        &extra.join("worker/.codex-home/sessions/old.jsonl"),
+        DAY * 5,
+    );
+    let configured = sb.ccr(
+        &[
+            "config",
+            "--add-codex-root",
+            &format!("alpha={}", extra.display()),
+        ],
+        &[],
+    );
+    assert!(configured.status.success(), "{}", text(&configured));
+
+    let out = sb.ccr(&["sync", "--all", "--quiet"], &[]);
+
+    assert!(out.status.success(), "{}", text(&out));
+    assert!(sb.state()["hosts"]["alpha"]["last_epoch"].as_i64().unwrap() > 0);
+    let files = mirrored_jsonl(&sb.root().join("alpha/codex/sessions"));
+    assert!(files.iter().any(|p| p.file_name().unwrap() == "old.jsonl"));
 }
 
 #[test]

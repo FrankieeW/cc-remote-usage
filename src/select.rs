@@ -106,7 +106,8 @@ pub fn probe_candidates(
         }
     }
 
-    let dups = hosts::duplicates(&results, &local_fps, |h| hosts::source_rank(&specs, h));
+    let mut dups = hosts::duplicates(&results, &local_fps, |h| hosts::source_rank(&specs, h));
+    dups.retain(|host, _| !cfg.has_extra_codex_roots(host));
     if !quiet {
         for (h, why) in &dups {
             eprintln!("  跳过 {h}（{}）", why.describe());
@@ -115,7 +116,9 @@ pub fn probe_candidates(
     let probed = results.len();
     let active = results
         .into_iter()
-        .filter(|(h, p)| p.active() && !dups.contains_key(h))
+        .filter(|(h, p)| {
+            (p.active() || (p.ok && cfg.has_extra_codex_roots(h))) && !dups.contains_key(h)
+        })
         .collect();
     Ok(Probed {
         active,

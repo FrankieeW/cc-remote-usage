@@ -1,7 +1,7 @@
 //! 从服务器拉取会话日志并导入 CC Switch。
 
 use crate::ssh;
-use crate::state::{cc_switch_bin, root};
+use crate::state::root;
 use anyhow::{bail, Context, Result};
 use std::fs;
 use std::path::Path;
@@ -32,10 +32,21 @@ const IMPORT_APPS: [&str; 2] = ["codex", "claude"];
 
 /// 增量窗口往前多看 5 分钟，抵消服务器与本机的时钟偏差；
 /// 重复拉到的内容由 CC Switch 按字节偏移去重。
-const OVERLAP_SECS: i64 = 300;
+pub(crate) const OVERLAP_SECS: i64 = 300;
+
+pub struct HostSync<'a> {
+    pub host: &'a str,
+    pub since: i64,
+    pub extra_codex_roots: &'a [String],
+}
 
 /// 同步单台服务器：拉取 Codex / Claude 会话日志 → 调 cc-switch 导入用量。
-pub fn sync_host(host: &str, since: i64) -> Outcome {
+pub fn sync_host(plan: HostSync<'_>, bin: &Path) -> Outcome {
+    let HostSync {
+        host,
+        since,
+        extra_codex_roots,
+    } = plan;
     let dest = root().join(host);
     for (remote_sub, local_sub) in PULLS {
         let target = dest.join(local_sub);
@@ -47,7 +58,36 @@ pub fn sync_host(host: &str, since: i64) -> Outcome {
         }
     }
 
-    match import(&dest) {
+    if let Err(error) = crate::extra_sources::pull(host, since, extra_codex_roots) {
+        return fail(host, format!("额外 Codex 日志拉取失败：{error:#}"));
+    }
+    let mut outcome = import_mirror(host, bin);
+    if outcome.err.is_none() {
+        if let Err(error) = crate::extra_sources::record_imported(host, extra_codex_roots) {
+            outcome.err = Some(format!("保存额外日志回补状态失败：{error:#}"));
+        }
+    }
+    outcome
+}
+
+/// 重试已有镜像的导入，不连接远端，也不修改拉取断点。
+pub fn import_host(host: &str, bin: &Path) -> Outcome {
+    let dest = root().join(host);
+    if !dest.join("codex/sessions").is_dir() && !dest.join("claude/projects").is_dir() {
+        return fail(
+            host,
+            format!(
+                "本地镜像不存在：{}；请先运行 ccr sync {host}",
+                dest.display()
+            ),
+        );
+    }
+    import_mirror(host, bin)
+}
+
+fn import_mirror(host: &str, bin: &Path) -> Outcome {
+    let dest = root().join(host);
+    match import(&dest, bin) {
         Ok(stats) => Outcome {
             host: host.to_string(),
             imported: stats.imported,
@@ -107,7 +147,11 @@ const IMPORT_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 /// tar-over-SSH 增量拉取（服务器上通常没装 rsync，tar 到处都有）。
 fn pull(host: &str, remote_sub: &str, since: i64, local: &Path) -> Result<()> {
     let remote = remote_pull_script(remote_sub, since, chrono::Local::now().timestamp());
-    let mut ssh = ssh::spawn_script(host, &ssh::TRANSFER, &remote, Stdio::piped())
+    pull_archive(host, &remote, local)
+}
+
+pub(crate) fn pull_archive(host: &str, remote: &str, local: &Path) -> Result<()> {
+    let mut ssh = ssh::spawn_script(host, &ssh::TRANSFER, remote, Stdio::piped())
         .with_context(|| format!("无法启动 ssh（主机 {host}）"))?;
 
     let stdout = ssh.stdout.take().context("无法获取 ssh stdout")?;
@@ -173,11 +217,10 @@ struct ImportStats {
 }
 
 /// 调用 `cc-switch sessions sync-usage --app <app>`，用作用域环境变量只扫该主机的镜像目录。
-fn import(base: &Path) -> Result<ImportStats> {
-    let bin = cc_switch_bin();
+fn import(base: &Path, bin: &Path) -> Result<ImportStats> {
     let mut total = ImportStats::default();
     for app in IMPORT_APPS {
-        let child = Command::new(&bin)
+        let child = Command::new(bin)
             .args(["sessions", "sync-usage", "--app", app, "--json"])
             .env("CODEX_HOME", base.join("codex"))
             .env("CLAUDE_CONFIG_DIR", base.join("claude"))

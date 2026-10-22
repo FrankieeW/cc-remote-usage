@@ -6,7 +6,10 @@
 //! 调 `cc-switch sessions sync-usage`，让服务器用量并入同一份统计。
 
 mod daemon;
+mod extra_sources;
 mod hosts;
+mod import_cmd;
+mod importer;
 mod mirror;
 mod report;
 mod select;
@@ -78,6 +81,14 @@ enum Cmd {
         quiet: bool,
     },
 
+    /// 只重试本机已有镜像的用量导入，不连接服务器
+    Import {
+        #[arg(required = true)]
+        hosts: Vec<String>,
+        #[arg(long)]
+        quiet: bool,
+    },
+
     /// 按服务器 / 模型汇总用量（Token 与折算花费）
     Report {
         /// 统计窗口（天）
@@ -104,20 +115,35 @@ enum Cmd {
     },
 
     /// 查看 / 修改配置
-    Config {
-        /// 设置默认同步主机，逗号分隔（传空字符串清空）
-        #[arg(long)]
-        set_hosts: Option<String>,
-        /// 设置默认回溯天数
-        #[arg(long)]
-        set_days: Option<u64>,
-        /// 设置退避：基础分钟,上限分钟（如 15,360）
-        #[arg(long)]
-        set_backoff: Option<String>,
-        /// 设置镜像保留天数（按文件修改时间清理，0 表示不清理）
-        #[arg(long)]
-        set_retain_days: Option<u64>,
-    },
+    Config(ConfigArgs),
+}
+
+#[derive(clap::Args, Debug)]
+struct ConfigArgs {
+    /// 设置默认同步主机，逗号分隔（传空字符串清空）
+    #[arg(long)]
+    set_hosts: Option<String>,
+    /// 设置默认回溯天数
+    #[arg(long)]
+    set_days: Option<u64>,
+    /// 设置退避：基础分钟,上限分钟（如 15,360）
+    #[arg(long)]
+    set_backoff: Option<String>,
+    /// 设置镜像保留天数（按文件修改时间清理，0 表示不清理）
+    #[arg(long)]
+    set_retain_days: Option<u64>,
+    /// 将当前安装的 cc-switch 版本锁定为已确认的兼容版本
+    #[arg(long, conflicts_with = "unpin_cc_switch")]
+    pin_cc_switch: bool,
+    /// 取消 cc-switch 版本锁定
+    #[arg(long)]
+    unpin_cc_switch: bool,
+    /// 添加额外 Codex 日志根目录，格式为 主机=远端绝对路径；可重复指定
+    #[arg(long)]
+    add_codex_root: Vec<String>,
+    /// 清空指定主机的额外 Codex 日志目录
+    #[arg(long)]
+    clear_codex_roots: Option<String>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -162,6 +188,7 @@ fn run(cli: Cli) -> Result<()> {
             dry_run,
             quiet,
         } => cmd_sync(hosts, all, days, force, retry_now, dry_run, quiet),
+        Cmd::Import { hosts, quiet } => import_cmd::run(hosts, quiet),
         Cmd::Report {
             days,
             host,
@@ -190,12 +217,7 @@ fn run(cli: Cli) -> Result<()> {
             DaemonCmd::Uninstall => daemon::uninstall(),
             DaemonCmd::Status => daemon::status(),
         },
-        Cmd::Config {
-            set_hosts,
-            set_days,
-            set_backoff,
-            set_retain_days,
-        } => cmd_config(set_hosts, set_days, set_backoff, set_retain_days),
+        Cmd::Config(args) => cmd_config(args),
     }
 }
 
@@ -282,7 +304,8 @@ fn cmd_hosts(probe: bool, json: bool, force: bool) -> Result<()> {
         None => false,
     };
 
-    let dups = hosts::duplicates(&results, &local_fps, |h| hosts::source_rank(&specs, h));
+    let mut dups = hosts::duplicates(&results, &local_fps, |h| hosts::source_rank(&specs, h));
+    dups.retain(|host, _| !cfg.has_extra_codex_roots(host));
     let by_id: BTreeMap<&str, &hosts::Probe> =
         results.iter().map(|(h, p)| (h.as_str(), p)).collect();
 
@@ -300,6 +323,7 @@ fn cmd_hosts(probe: bool, json: bool, force: bool) -> Result<()> {
                     "codex_recent_files": p.map(|p| p.codex).unwrap_or(0),
                     "claude_recent_files": p.map(|p| p.claude).unwrap_or(0),
                     "codex_size": p.map(|p| p.size.clone()).unwrap_or_default(),
+                    "extra_codex_roots": cfg.extra_codex_roots.get(&s.id),
                     "error": p.and_then(|p| p.err.clone()),
                     "cooling_until": cooling,
                     "duplicate_of": match dup {
@@ -353,6 +377,9 @@ fn cmd_hosts(probe: bool, json: bool, force: bool) -> Result<()> {
         let (status, note) = match dups.get(&s.id) {
             Some(hosts::Skip::Local) => ("本机", hosts::Skip::Local.describe()),
             Some(skip) => ("重复", skip.describe()),
+            None if cfg.has_extra_codex_roots(&s.id) => {
+                ("可同步", "已配置额外 Codex 日志目录".into())
+            }
             None if p.active() => ("可同步", s.source.clone()),
             None => ("无日志", s.source.clone()),
         };
@@ -431,7 +458,8 @@ fn cmd_sync(
     dry_run: bool,
     quiet: bool,
 ) -> Result<()> {
-    let (cfg, config_ok) = state::load_config_checked();
+    let cfg = state::read_config()?;
+    extra_sources::validate_config(&cfg)?;
     let days = days.unwrap_or(cfg.days).max(1);
     let (mut hosts, explicit) = initial_hosts(cli_hosts, std::env::var("REMOTE_USAGE_HOSTS").ok());
     let respect_backoff = !(force || retry_now);
@@ -449,6 +477,7 @@ fn cmd_sync(
     }
     // 拿到锁之后再读状态，才能看到上一个进程写下的断点
     let mut state = load_state();
+    let importer = importer::Importer::check(&cfg)?;
 
     // 1) 决定要同步哪些主机
     if hosts.is_empty() {
@@ -466,7 +495,7 @@ fn cmd_sync(
             }
             if probed.active.is_empty() {
                 if !dry_run {
-                    prune_mirrors(&cfg, config_ok, quiet);
+                    prune_mirrors(&cfg, true, quiet);
                 }
                 if probed.all_unreachable() {
                     // 全军覆没多半是本机网络或 SSH agent 的问题，必须让定时任务日志看得到
@@ -518,7 +547,7 @@ fn cmd_sync(
                 println!("本轮没有需要同步的主机（全部在冷却中）。立即重试用 --retry-now。");
             }
             if !dry_run {
-                prune_mirrors(&cfg, config_ok, quiet);
+                prune_mirrors(&cfg, true, quiet);
             }
             return Ok(());
         }
@@ -550,7 +579,12 @@ fn cmd_sync(
                 .unwrap_or_else(|| now_epoch() - (days as i64) * 86400)
         };
         let started = now_epoch();
-        let outcome = sync::sync_host(host, since);
+        let plan = sync::HostSync {
+            host,
+            since,
+            extra_codex_roots: cfg.extra_codex_roots.get(host).map_or(&[], Vec::as_slice),
+        };
+        let outcome = sync::sync_host(plan, &importer.bin);
         match &outcome.err {
             None => record_success(&mut state, host, started, outcome.imported, outcome.scanned),
             Some(e) => record_failure(&cfg, &mut state, host, e),
@@ -563,7 +597,10 @@ fn cmd_sync(
     }
 
     // 3) 清理过期镜像（必须在导入之后）
-    prune_mirrors(&cfg, config_ok, quiet);
+    prune_mirrors(&cfg, true, quiet);
+
+    let ok = outcomes.iter().filter(|o| o.err.is_none()).count();
+    let imported: i64 = outcomes.iter().map(|o| o.imported).sum();
 
     if quiet {
         for o in &outcomes {
@@ -574,17 +611,17 @@ fn cmd_sync(
                 eprintln!("{}: cc-switch：{line}", o.host);
             }
         }
-        return Ok(());
+    } else {
+        println!(
+            "\n完成：{ok}/{} 台成功，共导入 {imported} 条用量记录（CC Switch 看板约 30 秒内刷新）",
+            outcomes.len()
+        );
+        if imported > 0 {
+            println!("查看明细：ccr report --days 2");
+        }
     }
-
-    let ok = outcomes.iter().filter(|o| o.err.is_none()).count();
-    let imported: i64 = outcomes.iter().map(|o| o.imported).sum();
-    println!(
-        "\n完成：{ok}/{} 台成功，共导入 {imported} 条用量记录（CC Switch 看板约 30 秒内刷新）",
-        outcomes.len()
-    );
-    if imported > 0 {
-        println!("查看明细：ccr report --days 2");
+    if ok < outcomes.len() {
+        bail!("{} 台同步失败", outcomes.len() - ok);
     }
     Ok(())
 }
@@ -654,16 +691,25 @@ fn cmd_status() -> Result<()> {
 
 // ---------------------------------------------------------------- config
 
-fn cmd_config(
-    set_hosts: Option<String>,
-    set_days: Option<u64>,
-    set_backoff: Option<String>,
-    set_retain_days: Option<u64>,
-) -> Result<()> {
+fn cmd_config(args: ConfigArgs) -> Result<()> {
+    let ConfigArgs {
+        set_hosts,
+        set_days,
+        set_backoff,
+        set_retain_days,
+        pin_cc_switch,
+        unpin_cc_switch,
+        add_codex_root,
+        clear_codex_roots,
+    } = args;
     let changing = set_hosts.is_some()
         || set_days.is_some()
         || set_backoff.is_some()
-        || set_retain_days.is_some();
+        || set_retain_days.is_some()
+        || pin_cc_switch
+        || unpin_cc_switch
+        || !add_codex_root.is_empty()
+        || clear_codex_roots.is_some();
     // 要改配置时严格读取：文件写坏了就报错，不能拿默认值把它整个覆盖掉
     let mut cfg = if changing {
         state::read_config()?
@@ -697,6 +743,31 @@ fn cmd_config(
         cfg.retain_days = r;
         println!("镜像保留天数：{r}（0 表示不清理）");
     }
+    if pin_cc_switch {
+        let importer = importer::Importer::detect(&cfg)?;
+        println!("锁定 cc-switch 版本：{}", importer.version);
+        cfg.cc_switch_version = Some(importer.version);
+    }
+    if unpin_cc_switch {
+        cfg.cc_switch_version = None;
+    }
+    if let Some(host) = clear_codex_roots {
+        check_hosts(std::slice::from_ref(&host))?;
+        cfg.extra_codex_roots.remove(&host);
+    }
+    for source in add_codex_root {
+        let Some((host, path)) = source.split_once('=') else {
+            bail!("额外目录格式应为 主机=/远端/目录");
+        };
+        check_hosts(&[host.to_owned()])?;
+        extra_sources::validate_root(path)?;
+        let roots = cfg.extra_codex_roots.entry(host.to_owned()).or_default();
+        let path = path.trim_end_matches('/').to_owned();
+        if !roots.contains(&path) {
+            roots.push(path);
+            roots.sort();
+        }
+    }
     if changing {
         save_config(&cfg)?;
     }
@@ -705,6 +776,8 @@ fn cmd_config(
     println!("  hosts   = {:?}", cfg.hosts);
     println!("  days    = {}", cfg.days);
     println!("  cc_switch = {:?}", cfg.cc_switch);
+    println!("  cc_switch_version = {:?}", cfg.cc_switch_version);
+    println!("  extra_codex_roots = {:?}", cfg.extra_codex_roots);
     println!(
         "  backoff = 基础 {} 分钟 → 上限 {} 分钟",
         cfg.backoff_base_min, cfg.backoff_max_min

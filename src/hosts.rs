@@ -58,7 +58,14 @@ pub fn discover() -> Vec<HostSpec> {
         .map(|(alias, _, _)| alias.clone())
         .collect();
 
-    for h in load_config().hosts {
+    let cfg = load_config();
+    let configured = cfg.hosts.iter().cloned().chain(
+        cfg.extra_codex_roots
+            .keys()
+            .filter(|host| cfg.has_extra_codex_roots(host))
+            .cloned(),
+    );
+    for h in configured {
         if valid_host_id(&h) {
             map.insert(
                 h.clone(),

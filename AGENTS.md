@@ -2,7 +2,7 @@
 
 **Generated:** 2026-10-21
 **Type:** Rust CLI (Cargo, edition 2021)
-**Size:** 9 source files (~3300 LOC including tests)
+**Size:** 12 source files
 
 ## Overview
 
@@ -24,6 +24,9 @@ cc-remote-usage/
 │   ├── hosts.rs            # 主机发现（ssh config + cc-fleet + 配置）、并行探测、别名指纹去重
 │   ├── ssh.rs              # 统一 ssh 参数（-T / RemoteCommand=none / BatchMode）与 stderr 摘要
 │   ├── sync.rs             # tar-over-SSH 增量拉取 + 按 app 调 cc-switch 导入
+│   ├── importer.rs         # CLI 版本预检、兼容版本锁定、固定二进制路径
+│   ├── import_cmd.rs       # 只重试本地镜像导入，保持远端拉取断点
+│   ├── extra_sources.rs    # 用户显式配置的额外 Codex 日志、首次回补、浅层镜像
 │   ├── mirror.rs           # 镜像保留期清理
 │   ├── report.rs           # 会话日志解析与去重、model-pricing 计价、表格/JSON 输出
 │   └── daemon.rs           # launchd 定时任务安装/卸载/状态
@@ -35,7 +38,7 @@ cc-remote-usage/
 
 ```bash
 cargo build --release --offline   # 本机 crates.io 403，必须离线
-cargo test --offline              # 51 个单测 + 7 个端到端（tests/cli.rs）：
+cargo test --offline              # 51 个单测 + 15 个端到端（tests/cli.rs）：
                                   # 单测里用本机 sh 直接跑远端脚本（macOS 上即 BSD 工具）；
                                   # 端到端用假 ssh / cc-switch 跑真二进制，覆盖 sync 全流程
 ```
@@ -83,6 +86,13 @@ ccr daemon install --interval 900
     return 之前落盘；本轮探测全部连不上时以非零退出码报错（定时任务日志要看得到）。
 14. `report` 去重键：Claude `message.id`（CC Switch 记作 `session:<id>`）、Codex `response_id`，跨主机共享。
 15. 主机名同时是 ssh 参数和镜像目录名，入口处用 `hosts::valid_host_id` 校验。
+16. `cc_switch_version` 是用户确认兼容后锁定的 CLI 版本；同步必须在探测/拉取前检查。
+    配置解析失败时整轮停止，不能回退到默认配置绕过锁定。
+17. `ccr import` 与同步共用运行锁，只重试已有镜像，成功也不能推进 `last_epoch`。
+18. 普通同步与本地导入只要有主机失败，就返回非零退出码，`--quiet` 同样适用。
+19. 额外 Codex 目录必须由用户通过 `--add-codex-root 主机=绝对路径` 显式配置，默认不开启。
+    只传输 `sessions` / `archived_sessions` 下的 JSONL，不传输 auth/config；跳过材料副本。
+    配置变化后的首次回补仅在成功导入后记为完成；镜像需适应上游最多三层的扫描深度。
 
 ## 踩坑速查
 
@@ -132,7 +142,7 @@ ccr daemon install --interval 900
 
 ## 与上游的约定
 
-- 依赖 CC Switch 支持 `sessions sync-usage --app <codex|claude> --json`（实测 5.11.2；输出
+- 依赖 CC Switch 支持 `sessions sync-usage --app <codex|claude> --json`（实测 5.11.3；输出
   `imported` / `filesScanned` / `errors` 等）。
 - `cc-switch` 路径：配置 > PATH > `/opt/homebrew/bin/cc-switch`。
 - 若上游改 JSON 字段名，`sync.rs::parse_import` 缺 `imported` 时明确报错（不会悄悄记 0）；
