@@ -4,10 +4,12 @@ use crate::ssh;
 use crate::state::root;
 use anyhow::{bail, Context, Result};
 use std::fs;
+use std::io::{Read, Write};
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::{Command, ExitStatus, Stdio};
+use std::sync::mpsc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 pub struct Outcome {
     pub host: String,
@@ -141,6 +143,99 @@ exit "$rc"
 /// ServerAlive 检测不到，没有上限就会一直占着运行锁、后面的同步全被跳过。
 const TRANSFER_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 
+/// 传输停滞的判定：字节流在窗口期内没有任何新增。
+///
+/// 远端命令被杀掉时，ssh 通道不会正常关闭（管道半死：远端 sshd 会话还活着，
+/// 但命令进程和管道写端都没了），本地 tar 会永远等不到 EOF。
+/// ServerAlive 只探测连接活不活（连接确实还活着），察觉不到这种半死状态——
+/// 所以只能靠"多久没有新字节"来判定传输已经死了。
+const TRANSFER_IDLE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+
+/// 首个字节的等待上限：远端 find 扫大目录树期间本来就一个字节都没有，
+/// 那段时间不算停滞，等首个字节到了才切回停滞判定。
+const TRANSFER_STARTUP_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+
+/// 传输时限可用环境变量覆盖（秒）：生产留足余量，测试和特殊网络可以调小。
+fn env_secs(key: &str) -> Option<u64> {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|s| *s > 0)
+}
+
+fn transfer_idle_timeout() -> Duration {
+    Duration::from_secs(
+        env_secs("CCR_TRANSFER_IDLE_SECS").unwrap_or(TRANSFER_IDLE_TIMEOUT.as_secs()),
+    )
+}
+
+fn transfer_startup_timeout() -> Duration {
+    Duration::from_secs(
+        env_secs("CCR_TRANSFER_STARTUP_SECS").unwrap_or(TRANSFER_STARTUP_TIMEOUT.as_secs()),
+    )
+}
+
+/// 传输时限
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct TransferLimits {
+    /// 已经收到过数据之后，多久没有新字节算停滞
+    idle: Duration,
+    /// 还没收到第一个字节时，多久没动静算卡住
+    startup: Duration,
+}
+
+impl Default for TransferLimits {
+    fn default() -> Self {
+        TransferLimits {
+            idle: transfer_idle_timeout(),
+            startup: transfer_startup_timeout(),
+        }
+    }
+}
+
+/// 传输进度监视：记住最后一次收到字节的时间，判断传输是不是已经死了。
+struct Progress {
+    last: Instant,
+    got_data: bool,
+    limits: TransferLimits,
+}
+
+impl Progress {
+    fn new(limits: TransferLimits) -> Self {
+        Progress {
+            last: Instant::now(),
+            got_data: false,
+            limits,
+        }
+    }
+
+    /// 收到新数据
+    fn note(&mut self) {
+        self.last = Instant::now();
+        self.got_data = true;
+    }
+
+    /// 当前该用哪个上限：还没出过数据用启动上限，出过数据用停滞上限
+    fn limit(&self) -> Duration {
+        if self.got_data {
+            self.limits.idle
+        } else {
+            self.limits.startup
+        }
+    }
+
+    /// 距离判定停滞还剩多久；None = 已经到点
+    fn remaining(&self) -> Option<Duration> {
+        let elapsed = self.last.elapsed();
+        let limit = self.limit();
+        if elapsed >= limit {
+            None
+        } else {
+            Some(limit - elapsed)
+        }
+    }
+}
+
 /// cc-switch 导入的上限（首次导入大量日志也就几分钟；卡住多半是数据库被锁）
 const IMPORT_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 
@@ -151,6 +246,7 @@ fn pull(host: &str, remote_sub: &str, since: i64, local: &Path) -> Result<()> {
 }
 
 pub(crate) fn pull_archive(host: &str, remote: &str, local: &Path) -> Result<()> {
+    let limits = TransferLimits::default();
     let mut ssh = ssh::spawn_script(host, &ssh::TRANSFER, remote, Stdio::piped())
         .with_context(|| format!("无法启动 ssh（主机 {host}）"))?;
 
@@ -158,31 +254,115 @@ pub(crate) fn pull_archive(host: &str, remote: &str, local: &Path) -> Result<()>
     let stderr = ssh.stderr.take().context("无法获取 ssh stderr")?;
     // stderr 单独线程读：不读的话 ssh 写满管道就会卡住，tar 也跟着等
     let stderr_reader = thread::spawn(move || ssh::read_tail(stderr, 64 * 1024));
-    let watchdog = ssh::Watchdog::arm(ssh.id(), TRANSFER_TIMEOUT);
 
-    let tar_out = Command::new("tar")
+    let mut tar = match Command::new("tar")
         .arg("xzf")
         .arg("-")
         .arg("-C")
         .arg(local)
-        .stdin(Stdio::from(stdout))
+        .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()
-        .and_then(|tar| tar.wait_with_output());
-    let tar_out = match tar_out {
-        Ok(o) => o,
+    {
+        Ok(t) => t,
         Err(e) => {
             let _ = ssh.kill();
             let _ = ssh.wait();
-            watchdog.disarm();
             return Err(e).context("本地 tar 运行失败");
         }
     };
-    let ssh_status = ssh.wait();
+    let tar_stdin = tar.stdin.take().context("无法获取 tar stdin")?;
+    let mut tar_stderr = tar.stderr.take().context("无法获取 tar stderr")?;
+    let tar_err_reader = thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = tar_stderr.read_to_end(&mut buf);
+        String::from_utf8_lossy(&buf).into_owned()
+    });
+
+    // ssh stdout → tar stdin 之间插一层泵：边转发边数字节。
+    // 以前直接把 ssh 的 stdout 当 tar 的 stdin，远端命令被杀后管道永远等不到 EOF，
+    // 只能等满 60 分钟的总时长上限才收场——整轮同步和后续定时任务全被它拖住。
+    let (tx, rx) = mpsc::channel::<u64>();
+    let pump = thread::spawn(move || {
+        let mut src = stdout;
+        let mut dst = tar_stdin;
+        let mut buf = vec![0u8; 256 * 1024];
+        loop {
+            match src.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if tx.send(n as u64).is_err() {
+                        break;
+                    }
+                    if dst.write_all(&buf[..n]).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    let watchdog = ssh::Watchdog::arm(ssh.id(), TRANSFER_TIMEOUT);
+    let mut progress = Progress::new(limits);
+    let mut pump_done = false;
+    let mut stalled = false;
+    let tar_status: Option<ExitStatus>;
+
+    // 等 tar 收尾，同时盯着字节流还有没有在动
+    loop {
+        match tar.try_wait() {
+            Ok(Some(status)) => {
+                tar_status = Some(status);
+                break;
+            }
+            Ok(None) => {}
+            Err(e) => {
+                let _ = ssh.kill();
+                let _ = ssh.wait();
+                watchdog.disarm();
+                let _ = pump.join();
+                let _ = tar_err_reader.join();
+                return Err(e).context("等待本地 tar 失败");
+            }
+        }
+        if pump_done {
+            thread::sleep(Duration::from_secs(1));
+        } else {
+            match rx.recv_timeout(Duration::from_secs(1)) {
+                Ok(_) => {
+                    progress.note();
+                    continue;
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => pump_done = true,
+            }
+        }
+        if progress.remaining().is_none() {
+            // 停滞：远端命令多半已经被杀了，但 ssh 通道不会关闭
+            stalled = true;
+            let _ = ssh.kill();
+            tar_status = tar.wait().ok();
+            break;
+        }
+    }
+
     let timed_out = watchdog.disarm();
+    let ssh_status = ssh.wait().context("等待 ssh 退出失败")?;
     let ssh_err = stderr_reader.join().unwrap_or_default();
-    let ssh_status = ssh_status.context("等待 ssh 退出失败")?;
+    let _ = pump.join();
+    let tar_err_text = tar_err_reader.join().unwrap_or_default();
+
+    if stalled {
+        let secs = limits.idle.as_secs();
+        let human = if secs >= 60 {
+            format!("{} 分钟", secs / 60)
+        } else {
+            format!("{secs} 秒")
+        };
+        bail!("传输停滞：{human}没有收到新数据（远端命令可能已被终止），已中止（下轮重试）");
+    }
     // 计时恰好在 ssh 自己退出之后才到点时不算超时（那次 kill 落空了）
     if timed_out && ssh_status.code().is_none() {
         bail!(
@@ -191,10 +371,10 @@ pub(crate) fn pull_archive(host: &str, remote: &str, local: &Path) -> Result<()>
         );
     }
 
-    let tar_err = (!tar_out.status.success()).then(|| {
-        ssh::last_line(&String::from_utf8_lossy(&tar_out.stderr))
-            .unwrap_or_else(|| "tar 解包失败".to_string())
-    });
+    let tar_err = tar_status
+        .map(|s| !s.success())
+        .unwrap_or(true)
+        .then(|| ssh::last_line(&tar_err_text).unwrap_or_else(|| "tar 解包失败".to_string()));
     if !ssh_status.success() {
         let reason = ssh::describe_exit(ssh_status.code(), &ssh_err);
         match tar_err {
@@ -319,6 +499,53 @@ mod tests {
     use std::io::Write;
 
     const HOUR: Duration = Duration::from_secs(3600);
+
+    #[test]
+    fn progress_uses_startup_limit_until_the_first_byte_arrives() {
+        let limits = TransferLimits {
+            idle: Duration::from_secs(10),
+            startup: Duration::from_secs(100),
+        };
+        let mut p = Progress::new(limits);
+        // 一个字节都还没有时，用启动上限（大目录树扫描期间本来就静默）
+        assert_eq!(p.limit(), limits.startup);
+        assert!(p.remaining().is_some());
+
+        p.note();
+        // 收到数据后切回停滞上限
+        assert_eq!(p.limit(), limits.idle);
+        assert!(p.remaining().is_some());
+    }
+
+    #[test]
+    fn progress_reports_stall_once_the_window_expires() {
+        let limits = TransferLimits {
+            idle: Duration::from_secs(0),
+            startup: Duration::from_secs(0),
+        };
+        let p = Progress::new(limits);
+        // 窗口为 0：立刻到点
+        assert!(p.remaining().is_none());
+
+        let mut p = Progress::new(limits);
+        p.note();
+        assert!(p.remaining().is_none(), "出过数据后按停滞上限判定");
+    }
+
+    #[test]
+    fn transfer_limits_can_be_overridden_by_env() {
+        // 环境变量只在进程内读一次，这里直接验证解析规则
+        assert_eq!(
+            env_secs("CCR_TRANSFER_IDLE_SECS"),
+            None,
+            "没设置就没有覆盖值"
+        );
+        std::env::set_var("CCR_TRANSFER_IDLE_SECS", " 42 ");
+        assert_eq!(env_secs("CCR_TRANSFER_IDLE_SECS"), Some(42));
+        std::env::set_var("CCR_TRANSFER_IDLE_SECS", "0");
+        assert_eq!(env_secs("CCR_TRANSFER_IDLE_SECS"), None, "0 不是有效时限");
+        std::env::remove_var("CCR_TRANSFER_IDLE_SECS");
+    }
 
     #[test]
     fn parse_import_reads_cc_switch_5_json() {

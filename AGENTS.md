@@ -93,6 +93,11 @@ ccr daemon install --interval 900
 19. 额外 Codex 目录必须由用户通过 `--add-codex-root 主机=绝对路径` 显式配置，默认不开启。
     只传输 `sessions` / `archived_sessions` 下的 JSONL，不传输 auth/config；跳过材料副本。
     配置变化后的首次回补仅在成功导入后记为完成；镜像需适应上游最多三层的扫描深度。
+20. **传输停滞必须自己收场**：远端命令被杀时 ssh 通道不会关闭（管道半死），本地 tar 永远等不到
+    EOF；ServerAlive 只探测连接活不活，发现不了这种情况。ssh stdout → tar stdin 之间必须有转发泵
+    数字节，传输中超过 10 分钟没新数据（或 15 分钟没等到第一个字节）就 kill 并记失败进退避。
+    否则一台机器会占着 `sync.lock` 把整轮同步和后续定时任务全拖死。阈值可用
+    `CCR_TRANSFER_IDLE_SECS` / `CCR_TRANSFER_STARTUP_SECS` 覆盖。
 
 ## 踩坑速查
 
@@ -114,6 +119,8 @@ ccr daemon install --interval 900
 | 并行跑测试时锁偶尔"释放了还拿不到" | 别的测试线程 fork 子进程，exec 前短暂持有 fd 副本 | 测试里重试，生产无影响 |
 | 同一台 Mac 被同步好几遍 | 多个别名指向同一台机器 | 探测指纹去重，`hosts --probe` 标为「重复」 |
 | 本机 `find` 测试结论与远端不符 | Claude Code 的 shell 把 `find` 包成了 bfs | 验证 BSD 行为用 `/usr/bin/find` 或 `sh -c` |
+| 某台机器不再有数据，别的主机也跟着停了 | 远端命令被杀 → ssh 通道半死不关，本地 tar 死等 EOF，占着运行锁 | 传输停滞检测（无新数据即中止），见不变量 20 |
+| 磁盘被 `.extra-codex-*` 目录吃满 | 上一轮被杀留下暂存目录没人回收 | 每轮开始先清残留（运行锁保证没有并发同步） |
 
 ## 安装方式
 

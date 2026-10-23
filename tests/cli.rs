@@ -9,7 +9,7 @@ use serde_json::Value;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 use std::time::{Duration, SystemTime};
 
 const DAY: Duration = Duration::from_secs(86_400);
@@ -34,6 +34,15 @@ fi
 script=$(cat)
 case "$script" in *__CCR__*) kind=probe ;; *) kind=pull ;; esac
 echo "ssh $kind $host" >> "$FAKE_LOG"
+case "$host" in
+  stall*)
+    # 模拟远端命令被杀：吐出半个 gzip 头就卡住，管道永远不关闭，
+    # 本地 tar 等不到 EOF。ccr 必须靠"多久没有新字节"自己收场。
+    printf '\037\213\010\000\000\000\000\000\000\003'
+    sleep 20
+    exit 0
+    ;;
+esac
 printf '%s\n' "$script" | HOME="$FAKE_REMOTES/$home" "$@"
 "#;
 
@@ -114,6 +123,48 @@ impl Sandbox {
 
     fn calls(&self) -> String {
         fs::read_to_string(self.dir.join("calls.log")).unwrap_or_default()
+    }
+
+    /// 跑 ccr 并给一个上限：超时就杀掉，防止测试自己挂死。
+    /// 返回 (输出, 是否超时)。
+    fn ccr_with_timeout(
+        &self,
+        args: &[&str],
+        env: &[(&str, &str)],
+        limit: Duration,
+    ) -> (Output, bool) {
+        let path = format!(
+            "{}:{}",
+            self.dir.join("bin").display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_ccr"));
+        cmd.args(args)
+            .env("HOME", self.dir.join("home"))
+            .env("REMOTE_USAGE_ROOT", self.root())
+            .env("PATH", path)
+            .env("FAKE_REMOTES", self.dir.join("remotes"))
+            .env("FAKE_LOG", self.dir.join("calls.log"))
+            .env_remove("REMOTE_USAGE_HOSTS")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        for (k, v) in env {
+            cmd.env(k, v);
+        }
+        let mut child = cmd.spawn().unwrap();
+        let deadline = std::time::Instant::now() + limit;
+        loop {
+            if child.try_wait().unwrap().is_some() {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                return (child.wait_with_output().unwrap(), true);
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        (child.wait_with_output().unwrap(), false)
     }
 
     fn state(&self) -> Value {
@@ -559,5 +610,65 @@ fn aliases_of_one_machine_are_synced_once() {
     assert!(
         !calls.contains("ssh pull mac-lan"),
         "同一份日志只拉一次：\n{calls}"
+    );
+}
+
+/// 远端命令被杀后，ssh 通道不会关闭（管道半死），本地 tar 永远等不到 EOF。
+/// 这种情况下 ccr 必须靠"多久没有新字节"自己收场：
+/// 以前只能等满 60 分钟的总时长上限，整轮同步和后续定时任务全被一台主机拖住。
+#[test]
+fn stalled_transfer_is_aborted_instead_of_hanging_the_run() {
+    let sb = Sandbox::new("stall");
+    seed_remote(&sb, "stallbox");
+
+    let (out, timed_out) = sb.ccr_with_timeout(
+        &["sync", "stallbox"],
+        &[("CCR_TRANSFER_IDLE_SECS", "2")],
+        Duration::from_secs(60),
+    );
+    assert!(
+        !timed_out,
+        "传输停滞必须自己收场，不能一直挂着：\n{}",
+        text(&out)
+    );
+    assert!(!out.status.success(), "停滞要算失败：\n{}", text(&out));
+    assert!(
+        text(&out).contains("传输停滞"),
+        "要明确告诉用户是停滞而不是别的错误：\n{}",
+        text(&out)
+    );
+
+    // 失败要落进 state：下一轮这台机器进退避，不会再把整轮拖住
+    let state = sb.state();
+    let err = state["hosts"]["stallbox"]["last_error"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(err.contains("传输停滞"), "停滞原因要记进 state：{err}");
+    assert_eq!(
+        state["hosts"]["stallbox"]["failures"].as_u64(),
+        Some(1),
+        "停滞算一次失败，进入退避"
+    );
+}
+
+/// 传输停滞不能推进增量断点：拉了一半的日志不算同步成功，下轮还要重来。
+#[test]
+fn stalled_transfer_does_not_advance_the_checkpoint() {
+    let sb = Sandbox::new("stall-cp");
+    seed_remote(&sb, "stallbox");
+
+    let (out, timed_out) = sb.ccr_with_timeout(
+        &["sync", "stallbox"],
+        &[("CCR_TRANSFER_IDLE_SECS", "2")],
+        Duration::from_secs(60),
+    );
+    assert!(!timed_out);
+    assert!(!out.status.success());
+
+    let state = sb.state();
+    assert_eq!(
+        state["hosts"]["stallbox"]["last_epoch"].as_i64(),
+        Some(0),
+        "失败不能推进断点"
     );
 }

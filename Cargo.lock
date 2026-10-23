@@ -106,7 +106,7 @@ dependencies = [
 
 [[package]]
 name = "cc-remote-usage"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "anyhow",
  "chrono",

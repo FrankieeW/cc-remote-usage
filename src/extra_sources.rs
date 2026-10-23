@@ -36,6 +36,10 @@ pub fn pull(host: &str, since: i64, roots: &[String]) -> Result<()> {
     let already_imported =
         fs::read(base.join(".codex-roots.json")).is_ok_and(|previous| previous == snapshot);
     let since = if already_imported { since } else { 0 };
+    // 上一轮被杀掉（停滞超时、机器睡眠、Ctrl-C）时留下的暂存目录没人回收，
+    // 一次几十上百 MB 地攒着。同一时刻只会有一个 ccr sync 在跑（运行锁），
+    // 所以这里可以放心把上次的残留清掉。
+    cleanup_stale_staging(&base);
     let staging = tempfile::Builder::new()
         .prefix(".extra-codex-")
         .tempdir_in(&base)
@@ -54,6 +58,24 @@ pub fn record_imported(host: &str, roots: &[String]) -> Result<()> {
         &state::root().join(host).join(".codex-roots.json"),
         &serde_json::to_vec(roots)?,
     )
+}
+
+/// 清掉上一轮遗留的额外日志暂存目录（`.extra-codex-*`）。
+/// 只删自己创建的暂存目录，不碰 `codex/sessions` 镜像本体。
+fn cleanup_stale_staging(base: &Path) {
+    let Ok(rd) = fs::read_dir(base) else {
+        return;
+    };
+    for entry in rd.flatten() {
+        let name = entry.file_name();
+        if !name.to_string_lossy().starts_with(".extra-codex-") {
+            continue;
+        }
+        let path = entry.path();
+        if path.is_dir() {
+            let _ = fs::remove_dir_all(&path);
+        }
+    }
 }
 
 fn flatten(dir: &Path, staging: &Path, destination: &Path) -> Result<()> {
