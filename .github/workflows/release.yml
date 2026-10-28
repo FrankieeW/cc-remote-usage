@@ -40,7 +40,11 @@ jobs:
           mkdir -p dist
           cp "target/${{ matrix.target }}/release/ccr" "dist/ccr-${{ matrix.target }}"
           chmod +x "dist/ccr-${{ matrix.target }}"
-          tar -C dist -czf "dist/ccr-${{ matrix.target }}.tar.gz" "ccr-${{ matrix.target }}"
+          mkdir -p package
+          cp "dist/ccr-${{ matrix.target }}" package/
+          cp LICENSE package/LICENSE
+          cp crates/ccr-importer/UPSTREAM-LICENSE package/THIRD_PARTY_NOTICES
+          tar -C package -czf "dist/ccr-${{ matrix.target }}.tar.gz" "ccr-${{ matrix.target }}" LICENSE THIRD_PARTY_NOTICES
           ls -lh dist
 
       - uses: actions/upload-artifact@v4
@@ -53,6 +57,8 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
+
       - uses: actions/download-artifact@v4
         with:
           path: dist
@@ -60,7 +66,10 @@ jobs:
 
       - uses: softprops/action-gh-release@v2
         with:
-          files: dist/*
+          files: |
+            dist/*
+            LICENSE
+            crates/ccr-importer/UPSTREAM-LICENSE
           generate_release_notes: true
 
   npm:

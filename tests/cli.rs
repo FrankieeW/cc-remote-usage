@@ -54,7 +54,7 @@ if [ "$1" = --version ]; then
 fi
 echo "cc-switch CODEX_HOME=$CODEX_HOME CLAUDE_CONFIG_DIR=$CLAUDE_CONFIG_DIR $*" >> "$FAKE_LOG"
 if [ "${FAKE_CC_FAIL_IMPORT:-}" = 1 ]; then
-  echo 'database unavailable' >&2
+  printf 'database unavailable\ndatabase version: 23\ncheck for updates\n' >&2
   exit 1
 fi
 echo '{"imported":1,"skipped":0,"filesScanned":1,"suspectedDuplicates":0,"deferredFiles":0,"errors":[]}'
@@ -430,8 +430,17 @@ fn quiet_sync_reports_import_failures_with_nonzero_exit() {
     );
 
     assert!(!out.status.success(), "定时任务必须能观察到导入失败");
+    assert!(
+        text(&out).contains("database version: 23"),
+        "{}",
+        text(&out)
+    );
     assert_eq!(sb.state()["hosts"]["alpha"]["last_epoch"], 0);
     assert_eq!(sb.state()["hosts"]["alpha"]["failures"], 1);
+    assert!(sb.state()["hosts"]["alpha"]["last_error"]
+        .as_str()
+        .unwrap()
+        .contains("database version: 23"));
 }
 
 fn mirrored_jsonl(dir: &Path) -> Vec<PathBuf> {
@@ -671,4 +680,179 @@ fn stalled_transfer_does_not_advance_the_checkpoint() {
         Some(0),
         "失败不能推进断点"
     );
+}
+
+/// The native backend must preflight the database before SSH and preserve the pull checkpoint on failure.
+fn native_database(sb: &Sandbox, version: i64) -> PathBuf {
+    let dir = sb.dir.join("switch");
+    fs::create_dir_all(&dir).unwrap();
+    let conn = rusqlite::Connection::open(dir.join("cc-switch.db")).unwrap();
+    conn.execute_batch(&format!("PRAGMA user_version={version};
+CREATE TABLE proxy_request_logs (request_id TEXT PRIMARY KEY, provider_id TEXT NOT NULL, app_type TEXT NOT NULL,
+model TEXT NOT NULL, request_model TEXT, input_tokens INTEGER DEFAULT 0, output_tokens INTEGER DEFAULT 0,
+cache_read_tokens INTEGER DEFAULT 0, cache_creation_tokens INTEGER DEFAULT 0, input_token_semantics INTEGER DEFAULT 0,
+input_cost_usd TEXT DEFAULT '0', output_cost_usd TEXT DEFAULT '0', cache_read_cost_usd TEXT DEFAULT '0',
+cache_creation_cost_usd TEXT DEFAULT '0', total_cost_usd TEXT DEFAULT '0', latency_ms INTEGER NOT NULL,
+first_token_ms INTEGER, status_code INTEGER NOT NULL, error_message TEXT, session_id TEXT, provider_type TEXT,
+is_streaming INTEGER DEFAULT 0, cost_multiplier TEXT DEFAULT '1.0', created_at INTEGER NOT NULL, data_source TEXT DEFAULT 'proxy');
+CREATE TABLE session_log_sync(file_path TEXT PRIMARY KEY, last_modified INTEGER NOT NULL, last_line_offset INTEGER DEFAULT 0,
+last_synced_at INTEGER NOT NULL, last_byte_offset INTEGER, last_tail_fingerprint INTEGER);
+CREATE TABLE model_pricing(model_id TEXT PRIMARY KEY, input_cost_per_million TEXT, output_cost_per_million TEXT,
+cache_read_cost_per_million TEXT, cache_creation_cost_per_million TEXT);
+CREATE TABLE session_usage_dedup(data_source TEXT NOT NULL, request_id TEXT NOT NULL, semantic_id TEXT NOT NULL,
+has_entry_id INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(data_source,request_id));")).unwrap();
+    dir
+}
+
+#[test]
+fn native_importer_preflight_stops_before_ssh_on_unknown_database_version() {
+    let sb = Sandbox::new("native-preflight");
+    seed_remote(&sb, "alpha");
+    let db_dir = native_database(&sb, 24);
+    fs::write(
+        sb.root().join("config.json"),
+        r#"{"import_backend":"native"}"#,
+    )
+    .unwrap();
+    let out = sb.ccr(
+        &["sync", "alpha"],
+        &[("CC_SWITCH_CONFIG_DIR", db_dir.to_str().unwrap())],
+    );
+    assert!(!out.status.success());
+    assert!(text(&out).contains("schema 24"), "{}", text(&out));
+    assert!(!sb.calls().contains("ssh "));
+}
+
+#[test]
+fn native_importer_syncs_without_cc_switch_cli() {
+    let sb = Sandbox::new("native-sync");
+    seed_remote(&sb, "alpha");
+    let db_dir = native_database(&sb, 23);
+    let configured = sb.ccr(
+        &["config", "--set-importer", "native"],
+        &[("CC_SWITCH_CONFIG_DIR", db_dir.to_str().unwrap())],
+    );
+    assert!(configured.status.success(), "{}", text(&configured));
+    let cfg: Value =
+        serde_json::from_str(&fs::read_to_string(sb.root().join("config.json")).unwrap()).unwrap();
+    assert_eq!(cfg["import_backend"], "native");
+    let id = "00000000-0000-4000-8000-000000000123";
+    let file = sb.remote("alpha").join(format!(
+        ".codex/sessions/2026/07/10/rollout-2026-07-10T03-00-00-{id}.jsonl"
+    ));
+    fs::create_dir_all(file.parent().unwrap()).unwrap();
+    let lines = [
+        serde_json::json!({"type":"session_meta","timestamp":"2026-07-10T03:00:00Z","payload":{"id":id,"source":"cli"}}),
+        serde_json::json!({"type":"turn_context","timestamp":"2026-07-10T03:00:01Z","payload":{"model":"gpt-test"}}),
+        serde_json::json!({"type":"event_msg","timestamp":"2026-07-10T03:00:02Z","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"cached_input_tokens":40,"output_tokens":10,"total_tokens":110}}}}),
+    ];
+    fs::write(
+        file,
+        lines.iter().map(|v| format!("{v}\n")).collect::<String>(),
+    )
+    .unwrap();
+    let out = sb.ccr(
+        &["sync", "alpha"],
+        &[("CC_SWITCH_CONFIG_DIR", db_dir.to_str().unwrap())],
+    );
+    assert!(out.status.success(), "{}", text(&out));
+    let conn = rusqlite::Connection::open(db_dir.join("cc-switch.db")).unwrap();
+    let count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM proxy_request_logs WHERE data_source='codex_session'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(count, 1);
+    assert!(sb.state()["hosts"]["alpha"]["last_epoch"].as_i64().unwrap() > 0);
+    assert!(!sb.calls().contains("cc-switch "));
+    let out = sb.ccr(
+        &["import", "alpha"],
+        &[("CC_SWITCH_CONFIG_DIR", db_dir.to_str().unwrap())],
+    );
+    assert!(out.status.success(), "{}", text(&out));
+    let count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM proxy_request_logs WHERE data_source='codex_session'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(count, 1);
+}
+
+#[test]
+fn failed_import_preserves_old_mirror_files_for_retry() {
+    let sb = Sandbox::new("failed-import-preserves-mirror");
+    seed_remote(&sb, "alpha");
+    let stale = sb.root().join("alpha/codex/sessions/old.jsonl");
+    touch(&stale, DAY * 30);
+    let out = sb.ccr(&["sync", "alpha"], &[("FAKE_CC_FAIL_IMPORT", "1")]);
+    assert!(!out.status.success());
+    assert!(
+        stale.exists(),
+        "unimported mirror must survive a failed import"
+    );
+}
+
+#[test]
+fn native_import_failure_does_not_advance_checkpoint_or_prune() {
+    let sb = Sandbox::new("native-import-failure");
+    seed_remote(&sb, "alpha");
+    let db_dir = native_database(&sb, 23);
+    let conn = rusqlite::Connection::open(db_dir.join("cc-switch.db")).unwrap();
+    conn.execute_batch("CREATE TRIGGER reject_import BEFORE INSERT ON proxy_request_logs BEGIN SELECT RAISE(FAIL,'blocked'); END;").unwrap();
+    fs::write(
+        sb.root().join("config.json"),
+        r#"{"import_backend":"native"}"#,
+    )
+    .unwrap();
+    let old = sb.root().join("alpha/codex/sessions/old.jsonl");
+    touch(&old, DAY * 30);
+    let id = "00000000-0000-4000-8000-000000000124";
+    let file = sb.remote("alpha").join(format!(
+        ".codex/sessions/2026/07/10/rollout-2026-07-10T03-00-00-{id}.jsonl"
+    ));
+    fs::create_dir_all(file.parent().unwrap()).unwrap();
+    let lines = [
+        serde_json::json!({"type":"session_meta","timestamp":"2026-07-10T03:00:00Z","payload":{"id":id,"source":"cli"}}),
+        serde_json::json!({"type":"turn_context","timestamp":"2026-07-10T03:00:01Z","payload":{"model":"gpt-test"}}),
+        serde_json::json!({"type":"event_msg","timestamp":"2026-07-10T03:00:02Z","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"cached_input_tokens":40,"output_tokens":10,"total_tokens":110}}}}),
+    ];
+    fs::write(
+        file,
+        lines.iter().map(|v| format!("{v}\n")).collect::<String>(),
+    )
+    .unwrap();
+    let out = sb.ccr(
+        &["sync", "alpha", "--quiet"],
+        &[("CC_SWITCH_CONFIG_DIR", db_dir.to_str().unwrap())],
+    );
+    assert!(!out.status.success(), "{}", text(&out));
+    assert!(text(&out).contains("blocked"), "{}", text(&out));
+    assert_eq!(sb.state()["hosts"]["alpha"]["last_epoch"], 0);
+    assert!(
+        old.exists(),
+        "failed native import must preserve the old mirror"
+    );
+    let count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM session_log_sync WHERE file_path LIKE ?1",
+            [format!("%{id}%")],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(count, 0);
+}
+
+#[test]
+fn licenses_include_project_and_upstream_notice() {
+    let sb = Sandbox::new("licenses");
+    let out = sb.ccr(&["licenses"], &[]);
+    assert!(out.status.success(), "{}", text(&out));
+    let output = text(&out);
+    assert!(output.contains("Copyright (c) 2026 Frankie Wang"));
+    assert!(output.contains("Copyright (c) 2025 Jason Young"));
+    assert!(output.contains("Permission is hereby granted"));
 }

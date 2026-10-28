@@ -16,9 +16,9 @@ ccr --version
 [GitHub Releases](https://github.com/FrankieeW/cc-remote-usage/releases) 下载对应平台的二进制；
 网络受限时可手动下载后放到包内 `vendor/<platform>-<arch>/ccr` 并 `chmod +x`。
 
-> 需要本机已安装并配置好 CC Switch（`cc-switch` 在 PATH 里），且支持
-> `cc-switch sessions sync-usage --app <codex|claude>`（实测 5.11.3）。
-> 先确认 CLI 与桌面版兼容，再用 `ccr config --pin-cc-switch` 锁定 CLI 版本。
+> 需要本机已安装并配置好 CC Switch。可运行 `ccr config --set-importer native`
+> 使用内置导入器（目前支持数据库 schema 23）；也可使用兼容的 CC Switch CLI，
+> 通过 `ccr config --pin-cc-switch` 锁定已确认的 CLI 版本。
 
 ## 用法
 

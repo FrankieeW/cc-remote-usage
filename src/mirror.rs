@@ -24,7 +24,26 @@ pub struct Pruned {
 /// 例外：保留期内的 Codex 子代理会话（fork）的父会话链一并保留，缺了父会话
 /// CC Switch 会暂缓导入子会话。
 /// `retain_days == 0` 表示不清理；符号链接一律跳过、不跟随。
+#[cfg(test)]
 pub fn prune(root: &Path, retain_days: u64, now: SystemTime) -> Pruned {
+    prune_selected(root, retain_days, now, None)
+}
+
+pub fn prune_hosts(
+    root: &Path,
+    retain_days: u64,
+    now: SystemTime,
+    hosts: &HashSet<&str>,
+) -> Pruned {
+    prune_selected(root, retain_days, now, Some(hosts))
+}
+
+fn prune_selected(
+    root: &Path,
+    retain_days: u64,
+    now: SystemTime,
+    selected: Option<&HashSet<&str>>,
+) -> Pruned {
     let mut acc = Pruned::default();
     if retain_days == 0 {
         return acc;
@@ -37,6 +56,12 @@ pub fn prune(root: &Path, retain_days: u64, now: SystemTime) -> Pruned {
         return acc;
     };
     for host in hosts.flatten() {
+        if let Some(selected) = selected {
+            let name = host.file_name();
+            if !name.to_str().is_some_and(|name| selected.contains(name)) {
+                continue;
+            }
+        }
         if !host.file_type().map(|t| t.is_dir()).unwrap_or(false) {
             continue;
         }
@@ -108,28 +133,37 @@ fn collect(dir: &Path, cutoff: SystemTime, out: &mut Vec<Entry>) {
 /// 保留期内文件的父会话链上的旧文件（沿 `parent_thread_id` 一路往上）。
 /// 会话 id 就是 rollout 文件名末尾的 UUID。
 fn ancestors_of_retained(entries: &[Entry]) -> HashSet<PathBuf> {
-    let by_id: HashMap<&str, &Entry> = entries
-        .iter()
-        .filter_map(|e| Some((session_id(&e.path)?, e)))
-        .collect();
+    let mut by_id: HashMap<String, Vec<&Entry>> = HashMap::new();
+    for entry in entries {
+        if let Some(id) = session_id(&entry.path) {
+            by_id.entry(id.to_owned()).or_default().push(entry);
+        }
+        if let Some(id) = metadata_id(&entry.path) {
+            if session_id(&entry.path) != Some(id.as_str()) {
+                by_id.entry(id).or_default().push(entry);
+            }
+        }
+    }
     let mut keep = HashSet::new();
     let mut visited = HashSet::new();
     let mut frontier: Vec<String> = entries
         .iter()
         .filter(|e| !e.old)
-        .filter_map(|e| parent_id(&e.path))
+        .flat_map(|e| parent_ids(&e.path))
         .collect();
     while let Some(id) = frontier.pop() {
         if !visited.insert(id.clone()) {
             continue;
         }
-        let Some(parent) = by_id.get(id.as_str()) else {
+        let Some(parents) = by_id.get(id.as_str()) else {
             continue;
         };
-        if parent.old {
-            keep.insert(parent.path.clone());
+        for parent in parents {
+            if parent.old {
+                keep.insert(parent.path.clone());
+            }
+            frontier.extend(parent_ids(&parent.path));
         }
-        frontier.extend(parent_id(&parent.path));
     }
     keep
 }
@@ -140,18 +174,42 @@ fn session_id(p: &Path) -> Option<&str> {
 }
 
 /// rollout 首行 session_meta 里的 `parent_thread_id`（实测首行 20~50KB，读 1MB 封顶）
-fn parent_id(p: &Path) -> Option<String> {
-    let f = fs::File::open(p).ok()?;
+fn read_meta(p: &Path) -> Option<serde_json::Value> {
+    let Ok(f) = fs::File::open(p) else {
+        return None;
+    };
     let mut line = String::new();
-    BufReader::new(f.take(1 << 20)).read_line(&mut line).ok()?;
-    let v: serde_json::Value = serde_json::from_str(&line).ok()?;
-    if v["type"].as_str() != Some("session_meta") {
+    if BufReader::new(f.take(1 << 20))
+        .read_line(&mut line)
+        .is_err()
+    {
         return None;
     }
-    v["payload"]["parent_thread_id"]
-        .as_str()
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
+    let v: serde_json::Value = serde_json::from_str(&line).ok()?;
+    (v["type"].as_str() == Some("session_meta")).then_some(v)
+}
+
+fn metadata_id(p: &Path) -> Option<String> {
+    read_meta(p)?["payload"]["id"].as_str().map(str::to_owned)
+}
+
+fn parent_ids(p: &Path) -> Vec<String> {
+    let Some(v) = read_meta(p) else {
+        return Vec::new();
+    };
+    let payload = &v["payload"];
+    [
+        payload.get("parent_thread_id"),
+        payload.get("forked_from_id"),
+        payload.pointer("/source/subagent/thread_spawn/parent_thread_id"),
+        payload.pointer("/history_base/thread_id"),
+    ]
+    .into_iter()
+    .flatten()
+    .filter_map(serde_json::Value::as_str)
+    .filter(|s| !s.is_empty())
+    .map(str::to_owned)
+    .collect()
 }
 
 /// 自底向上删空目录（`remove_dir` 遇到非空目录会失败，正好只删空的），托管目录本身保留
@@ -259,6 +317,32 @@ mod tests {
         }
         assert!(!unrelated.exists(), "无关的旧会话照常清理");
         assert_eq!(pruned.files, 1);
+    }
+
+    #[test]
+    fn retains_nested_parent_and_all_continuation_pages() {
+        let root = scratch("prune-nested-parent");
+        let dir = root.join("h/codex/sessions/2026/10");
+        let parent_id = "01a0aaaa-0000-7000-8000-000000000001";
+        let page_id = "01a0bbbb-0000-7000-8000-000000000002";
+        let parent = rollout(&dir, parent_id, None, DAY * 30);
+        let page = rollout(&dir, page_id, None, DAY * 30);
+        fs::write(
+            &page,
+            format!("{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{parent_id}\"}}}}\n"),
+        )
+        .unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&page)
+            .unwrap()
+            .set_modified(SystemTime::now() - DAY * 30)
+            .unwrap();
+        let child = rollout(&dir, "01a0cccc-0000-7000-8000-000000000003", None, DAY);
+        fs::write(&child, format!("{{\"type\":\"session_meta\",\"payload\":{{\"source\":{{\"subagent\":{{\"thread_spawn\":{{\"parent_thread_id\":\"{parent_id}\"}}}}}}}}}}\n")).unwrap();
+        prune(&root, 7, SystemTime::now());
+        assert!(parent.exists());
+        assert!(page.exists());
     }
 
     #[test]

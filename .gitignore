@@ -1,6 +1,7 @@
 # ── Rust ───────────────────────────────────────────────
 # cargo 构建产物（根目录）；Cargo.lock 要提交，不要忽略
 /target/
+crates/*/target/
 **/*.rs.bk
 # rustfmt 备份
 

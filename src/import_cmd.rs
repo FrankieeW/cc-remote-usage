@@ -15,7 +15,7 @@ pub fn run(hosts: Vec<String>, quiet: bool) -> Result<()> {
     let mut failures = 0;
     let mut imported = 0;
     for host in &hosts {
-        let outcome = sync::import_host(host, &importer.bin);
+        let outcome = sync::import_host(host, &importer);
         match &outcome.err {
             Some(error) => {
                 failures += 1;
@@ -39,7 +39,7 @@ pub fn run(hosts: Vec<String>, quiet: bool) -> Result<()> {
                 eprintln!("{host}: {error}");
             }
             for warning in sync::warning_summary(&outcome.warnings) {
-                eprintln!("{host}: cc-switch：{warning}");
+                eprintln!("{host}: 导入警告：{warning}");
             }
         } else {
             println!("{host}（本地镜像）");

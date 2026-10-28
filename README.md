@@ -6,8 +6,8 @@ CC Switch 的「用量」看板只扫**本机**的会话日志（`~/.codex/sessi
 `CODEX_HOME` / `CLAUDE_CONFIG_DIR` 控制），所以跑在 VPS / 服务器上的 Codex、Claude Code
 agent 消耗不会出现在里面。
 
-`ccr` 把各服务器上的会话日志增量拉回本机镜像目录，再用作用域环境变量调用
-`cc-switch sessions sync-usage`，让服务器用量并入同一份统计 —— 看板里就能看到
+`ccr` 把各服务器上的会话日志增量拉回本机镜像目录，再通过内置导入器或
+`cc-switch sessions sync-usage` 导入用量，让服务器用量并入同一份统计 —— 看板里就能看到
 「今日用量」包含服务器上的 agent。
 
 ## 安装
@@ -47,6 +47,7 @@ ccr report --days 7       # 按服务器 / 模型汇总 Token 与折算花费
 ccr report --days 7 --daily   # 加逐日明细
 ccr report --json         # 机器可读
 ccr status                # 上次同步、连续失败次数、下次尝试时间、镜像占用
+ccr licenses              # 项目及内置导入器的许可证
 ccr daemon install        # 装 launchd 定时任务（默认每 15 分钟）
 ccr daemon status
 ccr daemon uninstall
@@ -54,6 +55,8 @@ ccr config --set-hosts netcup,frankie-vps   # 固定默认主机（不再交互�
 ccr config --set-days 3                     # 首次回溯天数
 ccr config --set-backoff 15,360             # 退避：基础 15 分钟，上限 6 小时
 ccr config --set-retain-days 7              # 镜像保留天数（0 = 不清理）
+ccr config --set-importer native            # 使用内置导入器（目前支持数据库 schema 23）
+ccr config --set-importer cc-switch         # 切回 CC Switch CLI
 ccr config --pin-cc-switch                 # 锁定当前安装的 CLI 版本
 ccr config --unpin-cc-switch               # 取消版本锁定
 ```
@@ -82,10 +85,18 @@ ccr config --clear-codex-roots server
 
 ## 导入器版本与失败重试
 
-先确认桌面版与 CLI 兼容，再执行 `ccr config --pin-cc-switch`。锁定记录在配置的
+内置导入器参考 CC Switch 桌面版 v4.0.21 的会话导入实现，支持 Codex / Claude，
+直接将用量与游标写入已有的 CC Switch 数据库，使用 SQLite 事务，不创建或迁移数据库。
+它只接受经过验证的 schema 23；数据库版本不匹配时在 SSH 探测之前停止。数据库默认位于
+`~/.cc-switch/cc-switch.db`，设置 `CC_SWITCH_CONFIG_DIR` 时使用该目录下的数据库。
+源代码及 MIT 版权信息见 [内置导入器](crates/ccr-importer/UPSTREAM-LICENSE)。
+现有安装默认仍用原 CLI 后端，运行 `ccr config --set-importer native` 显式切换。
+
+使用 CLI 后端时，先确认桌面版与 CLI 兼容，再执行 `ccr config --pin-cc-switch`。锁定记录在配置的
 `cc_switch_version` 中；每轮同步在探测 SSH、拉取日志之前检查 CLI 版本，并固定本轮
 执行的二进制路径。版本不一致会停止，确认新版本兼容后可重新锁定。版本锁定防止后续
 CLI 意外升级，不会自动判断桌面版与数据库是否兼容。
+该版本锁仅适用于 CLI 后端，切回 CLI 时仍然生效。
 
 日志已拉取、但导入失败时可运行 `ccr import <主机...>`，直接重试本地镜像。
 它沿用同步锁、清除成功主机的失败状态，但保持 `last_epoch` 不变；下次正常同步仍会补齐
@@ -123,8 +134,7 @@ CLI 意外升级，不会自动判断桌面版与数据库是否兼容。
 ~/.claude/projects/**.jsonl ──ssh tar──▶  ~/.cc-switch/remote-usage/<host>/claude/projects/
                                               │
                                               ▼
-                       CODEX_HOME=<host>/codex CLAUDE_CONFIG_DIR=<host>/claude \
-                         cc-switch sessions sync-usage --app codex|claude --json
+                       内置导入器 / cc-switch sessions sync-usage --app codex|claude
                                               │
                                               ▼
                        ~/.cc-switch/cc-switch.db: proxy_request_logs(data_source=codex_session/claude...)
@@ -136,7 +146,8 @@ CLI 意外升级，不会自动判断桌面版与数据库是否兼容。
 - **增量**：按文件 mtime 过滤（`find -newermt @<上次同步时间 - 5 分钟>`，多看 5 分钟抵消时钟偏差），
   状态存在 `~/.cc-switch/remote-usage/state.json`，每台同步完立即落盘；`--force` 可全量重拉。
 - **不需要 rsync**：服务器上通常没装，改用 `tar` 流式传输（gzip 压缩后走 SSH）。
-- **不碰 CC Switch 数据库**：只调用它自己的 CLI，等价于它内建的会话日志同步。
+- **数据库兼容**：内置导入器按经验证的 schema 写入，并在未知版本停止；CLI 后端通过
+  上游命令导入。两种方式都不复制 OAuth 凭据。
 - **只导入 Codex / Claude**：按 `--app` 逐个导入。`--all` 会连带扫本机 Gemini / Pi 等
   不受环境变量控制的目录，把本机用量算进服务器的导入数。
 - **去重**：CC Switch 自己按 `session_log_sync` 的 byte offset 去重，重复导入无副作用。
@@ -178,7 +189,7 @@ CLI 意外升级，不会自动判断桌面版与数据库是否兼容。
   不区分是哪台服务器。要看按服务器拆分用 `ccr report`。
 - **请求数口径**：Claude Code 把一次响应的每个内容块（thinking / text / tool_use）各写一行，
   `ccr report` 按 `message.id` 去重（Codex 按 `response_id`），与看板一致。
-- **磁盘**：镜像保留 7 天未更新的文件（`ccr config --set-retain-days`）；仍在进行的 Codex 子代理会话
+- **磁盘**：成功导入且没有暂缓或警告的主机，其镜像清理 7 天未更新的文件（`ccr config --set-retain-days`）；仍在进行的 Codex 子代理会话
   的父会话链会一并保留（CC Switch 导入子会话需要它）；`config.json` 写坏时本轮不清理。
   `report --days` 超过保留期时更早的数据可能不全，报告里会提示。首次全量可能较大（如 3 天 41 个 Codex rollout ≈ 228MB 压缩后）。
 - 服务器时钟与本地时区不一致时，"今日"归属按会话里记录的时间戳换算成本地时间。

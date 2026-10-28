@@ -7,6 +7,7 @@ use std::time::Duration;
 pub struct Importer {
     pub bin: PathBuf,
     pub version: String,
+    pub native_db: Option<PathBuf>,
 }
 
 impl Importer {
@@ -47,10 +48,25 @@ impl Importer {
         Ok(Self {
             bin,
             version: (*version).to_owned(),
+            native_db: None,
         })
     }
 
     pub fn check(cfg: &state::Config) -> Result<Self> {
+        if cfg.import_backend == state::ImportBackend::Native {
+            let dir = std::env::var_os("CC_SWITCH_CONFIG_DIR")
+                .filter(|s| !s.is_empty())
+                .map(PathBuf::from)
+                .unwrap_or_else(|| state::home().join(".cc-switch"));
+            let database = dir.join("cc-switch.db");
+            ccr_importer::preflight(&database)
+                .with_context(|| format!("内置导入器数据库预检失败：{}", database.display()))?;
+            return Ok(Self {
+                bin: std::env::current_exe().context("无法确定 ccr 可执行文件路径")?,
+                version: env!("CARGO_PKG_VERSION").to_owned(),
+                native_db: Some(database),
+            });
+        }
         let importer = Self::detect(cfg)?;
         if let Some(expected) = &cfg.cc_switch_version {
             if expected != &importer.version {

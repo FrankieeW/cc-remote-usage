@@ -130,8 +130,19 @@ pub fn install(interval: u64, hosts: &[String]) -> Result<()> {
     }
 
     println!("✓ 已安装定时任务 {LABEL}");
-    println!("  每 {} 分钟同步一次：{}", interval.max(60) / 60, exe.display());
-    println!("  主机：{}", if hosts.is_empty() { "自动发现（可达且有日志）".into() } else { hosts.join(", ") });
+    println!(
+        "  每 {} 分钟同步一次：{}",
+        interval.max(60) / 60,
+        exe.display()
+    );
+    println!(
+        "  主机：{}",
+        if hosts.is_empty() {
+            "自动发现（可达且有日志）".into()
+        } else {
+            hosts.join(", ")
+        }
+    );
     println!("  日志：{}", dir.join("launchd.err.log").display());
     println!("  卸载：ccr daemon uninstall");
     Ok(())
@@ -171,7 +182,14 @@ pub fn status() -> Result<()> {
     if let Ok(t) = fs::read_to_string(&err) {
         if !t.trim().is_empty() {
             println!("\n最近错误日志（{}）：", err.display());
-            for l in t.lines().rev().take(5).collect::<Vec<_>>().into_iter().rev() {
+            for l in t
+                .lines()
+                .rev()
+                .take(5)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+            {
                 println!("  {l}");
             }
         }

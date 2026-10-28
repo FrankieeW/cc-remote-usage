@@ -82,8 +82,8 @@ function download(u, redirects = 0) {
 
     // 自检：二进制能跑且有正确版本号
     const out = execFileSync(dest, ['--version'], { encoding: 'utf8' }).trim();
-    if (!/^ccr \d+\.\d+\.\d+/.test(out)) {
-      throw new Error(`二进制自检失败：${out}`);
+    if (out !== `ccr ${version}`) {
+      throw new Error(`二进制版本不匹配：期望 ccr ${version}，实际 ${out}`);
     }
     console.log(`ccr: 已安装 ${out} (${triple})`);
   } catch (e) {

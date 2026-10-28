@@ -6,25 +6,26 @@
 
 ## Overview
 
-`ccr` 把服务器上 Codex / Claude Code agent 的会话日志增量拉回本机镜像目录，再用作用域化的
-`CODEX_HOME` / `CLAUDE_CONFIG_DIR` 调 `cc-switch sessions sync-usage`，让服务器用量并入
+`ccr` 把服务器上 Codex / Claude Code agent 的会话日志增量拉回本机镜像目录，再用
+内置导入器或作用域化的 `cc-switch sessions sync-usage`，让服务器用量并入
 CC Switch 的「用量」看板。
 
-不写 CC Switch 数据库，不复制 OAuth 凭据，只走它自己的 CLI。
+内置导入器按经验证的数据库 schema 写入用量和游标；CLI 后端走上游命令。不复制 OAuth 凭据。
 
 ## Project Structure
 
 ```
 cc-remote-usage/
 ├── Cargo.toml              # clap / serde_json / chrono / dialoguer / anyhow
+├── crates/ccr-importer/    # 内置导入器，源自 CC Switch 桌面版 v4.0.21，MIT
 ├── src/
 │   ├── main.rs             # CLI 定义与 hosts/sync/status/config 命令
 │   ├── select.rs           # 本轮同步哪些主机：点名 / 定时任务列表 / 配置 / 探测 + 冷却 + 去重
 │   ├── state.rs            # config.json / state.json 读写（原子写）、退避、运行锁、cc-switch 路径
 │   ├── hosts.rs            # 主机发现（ssh config + cc-fleet + 配置）、并行探测、别名指纹去重
 │   ├── ssh.rs              # 统一 ssh 参数（-T / RemoteCommand=none / BatchMode）与 stderr 摘要
-│   ├── sync.rs             # tar-over-SSH 增量拉取 + 按 app 调 cc-switch 导入
-│   ├── importer.rs         # CLI 版本预检、兼容版本锁定、固定二进制路径
+│   ├── sync.rs             # tar-over-SSH 增量拉取 + 按 app 导入
+│   ├── importer.rs         # 导入器选择、数据库或 CLI 版本预检
 │   ├── import_cmd.rs       # 只重试本地镜像导入，保持远端拉取断点
 │   ├── extra_sources.rs    # 用户显式配置的额外 Codex 日志、首次回补、浅层镜像
 │   ├── mirror.rs           # 镜像保留期清理
@@ -38,9 +39,10 @@ cc-remote-usage/
 
 ```bash
 cargo build --release --offline   # 本机 crates.io 403，必须离线
-cargo test --offline              # 51 个单测 + 15 个端到端（tests/cli.rs）：
+cargo test --offline              # 单测 + 端到端（tests/cli.rs）：
                                   # 单测里用本机 sh 直接跑远端脚本（macOS 上即 BSD 工具）；
                                   # 端到端用假 ssh / cc-switch 跑真二进制，覆盖 sync 全流程
+cargo test --manifest-path crates/ccr-importer/Cargo.toml --offline
 ```
 
 安装（**本机现在是 npm 管理的**，见下方「安装方式」一节）：
@@ -64,7 +66,7 @@ ccr daemon install --interval 900
 
 ## 关键不变量（改动前务必确认）
 
-1. **导入必须走 `cc-switch sessions sync-usage`**，不要直接 insert 进 `proxy_request_logs`。
+1. 内置导入器只支持已验证的 schema 23，预检必须先于探测/拉取；不得创建、迁移数据库或绕过 schema 校验。遵守上游去重、计价、事务和游标契约，数据库写入失败不得推进游标或拉取断点。CLI 后端继续走 `cc-switch sessions sync-usage`。
 2. **`last_epoch` 只在成功时推进**；失败推进会导致增量窗口漏文件。
 3. **退避状态与同步状态同存 `state.json`**，`record_failure` 只累加不覆盖 `last_epoch`。
 4. **命令行点名的主机必须无视冷却**（用户明确要求重试），`--force` / `--retry-now` 同理。
@@ -78,7 +80,7 @@ ccr daemon install --interval 900
    Gemini / Pi 等不受环境变量控制的目录，把本机用量记到服务器头上。
 10. 所有 ssh 调用都走 `ssh::command`（`-T -o BatchMode=yes -o RemoteCommand=none`）；远端脚本用
     `ssh::spawn_script` 经 `sh -s` 从 stdin 执行，不要再把脚本当命令行参数（fish / csh 登录 shell 会挂）。
-11. `mirror::prune` 必须在导入之后跑；只动 `<host>/codex/sessions`、`<host>/claude/projects`，不跟随符号链接；
+11. 镜像清理只在对应主机导入成功且无暂缓/警告后执行；只动 `<host>/codex/sessions`、`<host>/claude/projects`，不跟随符号链接；
     保留期内 Codex 子代理会话的父会话链（`parent_thread_id`）不删；`config.json` 解析失败时整轮不清理。
 12. `REMOTE_USAGE_HOSTS`（定时任务的主机列表）**不算点名**，照样受退避约束。
 13. `ccr sync` 持 `sync.lock` 运行（dry-run 除外，交互多选期间临时释放）；`hosts --probe` 不占锁，
@@ -86,7 +88,7 @@ ccr daemon install --interval 900
     return 之前落盘；本轮探测全部连不上时以非零退出码报错（定时任务日志要看得到）。
 14. `report` 去重键：Claude `message.id`（CC Switch 记作 `session:<id>`）、Codex `response_id`，跨主机共享。
 15. 主机名同时是 ssh 参数和镜像目录名，入口处用 `hosts::valid_host_id` 校验。
-16. `cc_switch_version` 是用户确认兼容后锁定的 CLI 版本；同步必须在探测/拉取前检查。
+16. `cc_switch_version` 是用户确认兼容后锁定的 CLI 版本；CLI 后端必须在探测/拉取前检查。
     配置解析失败时整轮停止，不能回退到默认配置绕过锁定。
 17. `ccr import` 与同步共用运行锁，只重试已有镜像，成功也不能推进 `last_epoch`。
 18. 普通同步与本地导入只要有主机失败，就返回非零退出码，`--quiet` 同样适用。

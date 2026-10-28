@@ -20,6 +20,9 @@ pub struct Config {
     /// 经用户确认与桌面版兼容的 CLI 版本；为空时不锁定。
     #[serde(default)]
     pub cc_switch_version: Option<String>,
+    /// Built-in importer is opt-in for existing installations.
+    #[serde(default)]
+    pub import_backend: ImportBackend,
     #[serde(default)]
     pub extra_codex_roots: BTreeMap<String, Vec<String>>,
     /// 连续失败后的基础冷却（分钟），默认 15
@@ -31,6 +34,14 @@ pub struct Config {
     /// 镜像保留天数（按文件 mtime），0 表示不清理；默认 7，与 `ccr report` 默认窗口一致
     #[serde(default = "default_retain_days")]
     pub retain_days: u64,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum ImportBackend {
+    #[default]
+    CcSwitch,
+    Native,
 }
 
 fn default_days() -> u64 {
@@ -64,6 +75,7 @@ impl Default for Config {
             days: default_days(),
             cc_switch: None,
             cc_switch_version: None,
+            import_backend: ImportBackend::CcSwitch,
             extra_codex_roots: BTreeMap::new(),
             backoff_base_min: default_backoff_base(),
             backoff_max_min: default_backoff_max(),

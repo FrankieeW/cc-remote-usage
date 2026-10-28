@@ -116,6 +116,20 @@ enum Cmd {
 
     /// 查看 / 修改配置
     Config(ConfigArgs),
+
+    /// 显示本项目和内置导入器的许可
+    Licenses,
+
+    /// Internal subprocess used to bound native import runtime.
+    #[command(hide = true)]
+    InternalImport {
+        #[arg(long)]
+        database: std::path::PathBuf,
+        #[arg(long)]
+        app: String,
+        #[arg(long)]
+        mirror: std::path::PathBuf,
+    },
 }
 
 #[derive(clap::Args, Debug)]
@@ -132,6 +146,9 @@ struct ConfigArgs {
     /// 设置镜像保留天数（按文件修改时间清理，0 表示不清理）
     #[arg(long)]
     set_retain_days: Option<u64>,
+    /// 选择用量导入器：native 或 cc-switch
+    #[arg(long, value_parser = ["native", "cc-switch"])]
+    set_importer: Option<String>,
     /// 将当前安装的 cc-switch 版本锁定为已确认的兼容版本
     #[arg(long, conflicts_with = "unpin_cc_switch")]
     pin_cc_switch: bool,
@@ -218,6 +235,26 @@ fn run(cli: Cli) -> Result<()> {
             DaemonCmd::Status => daemon::status(),
         },
         Cmd::Config(args) => cmd_config(args),
+        Cmd::Licenses => {
+            println!(
+                "{}\n\n--- CC Switch ---\n\n{}",
+                include_str!("../LICENSE"),
+                include_str!("../crates/ccr-importer/UPSTREAM-LICENSE")
+            );
+            Ok(())
+        }
+        Cmd::InternalImport {
+            database,
+            app,
+            mirror,
+        } => {
+            let result = ccr_importer::import(&database, &app, &mirror)?;
+            if !result.errors.is_empty() {
+                bail!("{}", result.errors.join("；"));
+            }
+            println!("{}", serde_json::to_string(&result)?);
+            Ok(())
+        }
     }
 }
 
@@ -407,14 +444,8 @@ fn cmd_hosts(probe: bool, json: bool, force: bool) -> Result<()> {
 
 /// 导入完成后按保留期清理镜像（先导入后清理，删掉的都是早已入库的旧文件）。
 /// 配置文件解析失败时不清理：按默认值删文件可能违背用户的设置（比如 `retain_days: 0`）。
-fn prune_mirrors(cfg: &Config, config_ok: bool, quiet: bool) {
-    if !config_ok {
-        if !quiet {
-            println!("配置文件解析失败，本轮不清理镜像。");
-        }
-        return;
-    }
-    let pruned = mirror::prune(&root(), cfg.retain_days, SystemTime::now());
+fn prune_mirrors(cfg: &Config, quiet: bool, hosts: &std::collections::HashSet<&str>) {
+    let pruned = mirror::prune_hosts(&root(), cfg.retain_days, SystemTime::now(), hosts);
     if !quiet && pruned.files > 0 {
         println!(
             "清理镜像：删除 {} 个超过 {} 天未更新的日志，释放 {}",
@@ -445,7 +476,7 @@ fn print_outcome(cfg: &Config, state: &State, outcome: &sync::Outcome) {
         }
     }
     for line in sync::warning_summary(&outcome.warnings) {
-        println!("  ⚠ cc-switch：{line}");
+        println!("  ⚠ 导入警告：{line}");
     }
 }
 
@@ -494,9 +525,6 @@ fn cmd_sync(
                 save_state(&state)?;
             }
             if probed.active.is_empty() {
-                if !dry_run {
-                    prune_mirrors(&cfg, true, quiet);
-                }
                 if probed.all_unreachable() {
                     // 全军覆没多半是本机网络或 SSH agent 的问题，必须让定时任务日志看得到
                     let (h, e) = &probed.unreachable[0];
@@ -546,9 +574,6 @@ fn cmd_sync(
             if !quiet {
                 println!("本轮没有需要同步的主机（全部在冷却中）。立即重试用 --retry-now。");
             }
-            if !dry_run {
-                prune_mirrors(&cfg, true, quiet);
-            }
             return Ok(());
         }
     }
@@ -584,7 +609,7 @@ fn cmd_sync(
             since,
             extra_codex_roots: cfg.extra_codex_roots.get(host).map_or(&[], Vec::as_slice),
         };
-        let outcome = sync::sync_host(plan, &importer.bin);
+        let outcome = sync::sync_host(plan, &importer);
         match &outcome.err {
             None => record_success(&mut state, host, started, outcome.imported, outcome.scanned),
             Some(e) => record_failure(&cfg, &mut state, host, e),
@@ -597,7 +622,12 @@ fn cmd_sync(
     }
 
     // 3) 清理过期镜像（必须在导入之后）
-    prune_mirrors(&cfg, true, quiet);
+    let safe_to_prune = outcomes
+        .iter()
+        .filter(|o| o.err.is_none() && o.warnings.is_empty())
+        .map(|o| o.host.as_str())
+        .collect();
+    prune_mirrors(&cfg, quiet, &safe_to_prune);
 
     let ok = outcomes.iter().filter(|o| o.err.is_none()).count();
     let imported: i64 = outcomes.iter().map(|o| o.imported).sum();
@@ -608,7 +638,7 @@ fn cmd_sync(
                 eprintln!("{}: {e}", o.host);
             }
             for line in sync::warning_summary(&o.warnings) {
-                eprintln!("{}: cc-switch：{line}", o.host);
+                eprintln!("{}: 导入警告：{line}", o.host);
             }
         }
     } else {
@@ -697,6 +727,7 @@ fn cmd_config(args: ConfigArgs) -> Result<()> {
         set_days,
         set_backoff,
         set_retain_days,
+        set_importer,
         pin_cc_switch,
         unpin_cc_switch,
         add_codex_root,
@@ -706,6 +737,7 @@ fn cmd_config(args: ConfigArgs) -> Result<()> {
         || set_days.is_some()
         || set_backoff.is_some()
         || set_retain_days.is_some()
+        || set_importer.is_some()
         || pin_cc_switch
         || unpin_cc_switch
         || !add_codex_root.is_empty()
@@ -743,6 +775,17 @@ fn cmd_config(args: ConfigArgs) -> Result<()> {
         cfg.retain_days = r;
         println!("镜像保留天数：{r}（0 表示不清理）");
     }
+    if let Some(backend) = set_importer {
+        cfg.import_backend = if backend == "native" {
+            state::ImportBackend::Native
+        } else {
+            state::ImportBackend::CcSwitch
+        };
+        if cfg.import_backend == state::ImportBackend::Native {
+            importer::Importer::check(&cfg)?;
+        }
+        println!("导入器：{backend}");
+    }
     if pin_cc_switch {
         let importer = importer::Importer::detect(&cfg)?;
         println!("锁定 cc-switch 版本：{}", importer.version);
@@ -777,6 +820,7 @@ fn cmd_config(args: ConfigArgs) -> Result<()> {
     println!("  days    = {}", cfg.days);
     println!("  cc_switch = {:?}", cfg.cc_switch);
     println!("  cc_switch_version = {:?}", cfg.cc_switch_version);
+    println!("  import_backend = {:?}", cfg.import_backend);
     println!("  extra_codex_roots = {:?}", cfg.extra_codex_roots);
     println!(
         "  backoff = 基础 {} 分钟 → 上限 {} 分钟",

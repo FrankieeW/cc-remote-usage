@@ -1,7 +1,7 @@
 //! 从服务器拉取会话日志并导入 CC Switch。
 
-use crate::ssh;
 use crate::state::root;
+use crate::{importer::Importer, ssh};
 use anyhow::{bail, Context, Result};
 use std::fs;
 use std::io::{Read, Write};
@@ -43,7 +43,7 @@ pub struct HostSync<'a> {
 }
 
 /// 同步单台服务器：拉取 Codex / Claude 会话日志 → 调 cc-switch 导入用量。
-pub fn sync_host(plan: HostSync<'_>, bin: &Path) -> Outcome {
+pub fn sync_host(plan: HostSync<'_>, importer: &Importer) -> Outcome {
     let HostSync {
         host,
         since,
@@ -63,7 +63,7 @@ pub fn sync_host(plan: HostSync<'_>, bin: &Path) -> Outcome {
     if let Err(error) = crate::extra_sources::pull(host, since, extra_codex_roots) {
         return fail(host, format!("额外 Codex 日志拉取失败：{error:#}"));
     }
-    let mut outcome = import_mirror(host, bin);
+    let mut outcome = import_mirror(host, importer);
     if outcome.err.is_none() {
         if let Err(error) = crate::extra_sources::record_imported(host, extra_codex_roots) {
             outcome.err = Some(format!("保存额外日志回补状态失败：{error:#}"));
@@ -73,7 +73,7 @@ pub fn sync_host(plan: HostSync<'_>, bin: &Path) -> Outcome {
 }
 
 /// 重试已有镜像的导入，不连接远端，也不修改拉取断点。
-pub fn import_host(host: &str, bin: &Path) -> Outcome {
+pub fn import_host(host: &str, importer: &Importer) -> Outcome {
     let dest = root().join(host);
     if !dest.join("codex/sessions").is_dir() && !dest.join("claude/projects").is_dir() {
         return fail(
@@ -84,12 +84,12 @@ pub fn import_host(host: &str, bin: &Path) -> Outcome {
             ),
         );
     }
-    import_mirror(host, bin)
+    import_mirror(host, importer)
 }
 
-fn import_mirror(host: &str, bin: &Path) -> Outcome {
+fn import_mirror(host: &str, importer: &Importer) -> Outcome {
     let dest = root().join(host);
-    match import(&dest, bin) {
+    match import(&dest, importer) {
         Ok(stats) => Outcome {
             host: host.to_string(),
             imported: stats.imported,
@@ -98,7 +98,7 @@ fn import_mirror(host: &str, bin: &Path) -> Outcome {
             warnings: stats.warnings,
             err: None,
         },
-        Err(e) => fail(host, format!("cc-switch 导入失败: {e:#}")),
+        Err(e) => fail(host, format!("用量导入失败: {e:#}")),
     }
 }
 
@@ -397,42 +397,63 @@ struct ImportStats {
 }
 
 /// 调用 `cc-switch sessions sync-usage --app <app>`，用作用域环境变量只扫该主机的镜像目录。
-fn import(base: &Path, bin: &Path) -> Result<ImportStats> {
+fn import(base: &Path, importer: &Importer) -> Result<ImportStats> {
     let mut total = ImportStats::default();
     for app in IMPORT_APPS {
-        let child = Command::new(bin)
-            .args(["sessions", "sync-usage", "--app", app, "--json"])
+        let mut command = Command::new(&importer.bin);
+        if let Some(db) = &importer.native_db {
+            command
+                .arg("internal-import")
+                .arg("--database")
+                .arg(db)
+                .args(["--app", app, "--mirror"])
+                .arg(base.join(app));
+        } else {
+            command.args(["sessions", "sync-usage", "--app", app, "--json"]);
+        }
+        let child = command
             .env("CODEX_HOME", base.join("codex"))
             .env("CLAUDE_CONFIG_DIR", base.join("claude"))
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .context("跑不起来 cc-switch，检查是否安装或 `ccr config` 里配置路径")?;
+            .context("无法启动用量导入器，检查安装和 `ccr config` 配置")?;
         let watchdog = ssh::Watchdog::arm(child.id(), IMPORT_TIMEOUT);
         let out = child.wait_with_output();
         let timed_out = watchdog.disarm();
         let out = out.context("等待 cc-switch 退出失败")?;
         if timed_out && out.status.code().is_none() {
             bail!(
-                "cc-switch（--app {app}）超过 {} 分钟没有返回，已中止",
+                "用量导入器（--app {app}）超过 {} 分钟没有返回，已中止",
                 IMPORT_TIMEOUT.as_secs() / 60
             );
         }
 
         if !out.status.success() {
             bail!(
-                "cc-switch（--app {app}）退出码 {:?}: {}",
+                "用量导入器（--app {app}）退出码 {:?}: {}",
                 out.status.code(),
-                ssh::last_line(&String::from_utf8_lossy(&out.stderr)).unwrap_or_default()
+                import_error_summary(&String::from_utf8_lossy(&out.stderr))
             );
         }
-        let stats = parse_import(&out.stdout).with_context(|| format!("cc-switch --app {app}"))?;
+        let stats = parse_import(&out.stdout).with_context(|| format!("用量导入器 --app {app}"))?;
         total.imported += stats.imported;
         total.scanned += stats.scanned;
         total.warnings.extend(stats.warnings);
     }
     Ok(total)
+}
+
+/// 保留错误开头的具体原因；上游多行诊断的最后一行往往只是通用升级建议。
+fn import_error_summary(stderr: &str) -> String {
+    let lines: Vec<_> = stderr
+        .lines()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+    let summary = lines.iter().take(5).copied().collect::<Vec<_>>().join("；");
+    summary.chars().take(600).collect()
 }
 
 /// 解析 `sync-usage --json`（CC Switch 5.x：imported / filesScanned / deferredFiles / errors …）。
