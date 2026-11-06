@@ -1,5 +1,6 @@
-use crate::{importer::Importer, select, state, sync};
+use crate::{importer::Importer, mirror, select, state, sync};
 use anyhow::{bail, Result};
+use std::{collections::HashSet, time::SystemTime};
 
 pub fn run(hosts: Vec<String>, quiet: bool) -> Result<()> {
     select::check_hosts(&hosts)?;
@@ -31,6 +32,14 @@ pub fn run(hosts: Vec<String>, quiet: bool) -> Result<()> {
                     outcome.scanned,
                 );
                 imported += outcome.imported;
+                if outcome.warnings.is_empty() {
+                    mirror::prune_hosts(
+                        &state::root(),
+                        cfg.retain_days,
+                        SystemTime::now(),
+                        &HashSet::from([host.as_str()]),
+                    );
+                }
             }
         }
         state::save_state(&state)?;

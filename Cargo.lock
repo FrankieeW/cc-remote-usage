@@ -200,7 +200,7 @@ dependencies = [
 
 [[package]]
 name = "cc-remote-usage"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "anyhow",
  "ccr-importer",

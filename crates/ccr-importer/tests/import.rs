@@ -64,12 +64,15 @@ fn write_lines(path: &Path, lines: &[Value]) {
         writeln!(f, "{line}").unwrap();
     }
 }
-fn meta(id: &str, parent: Option<&str>) -> Value {
+fn meta_at(id: &str, parent: Option<&str>, timestamp: &str) -> Value {
     let source = match parent {
         Some(p) => json!({"subagent":{"thread_spawn":{"parent_thread_id":p}}}),
         None => json!("cli"),
     };
-    json!({"timestamp":"2026-07-10T03:00:00Z","type":"session_meta","payload":{"id":id,"source":source}})
+    json!({"timestamp":timestamp,"type":"session_meta","payload":{"id":id,"source":source}})
+}
+fn meta(id: &str, parent: Option<&str>) -> Value {
+    meta_at(id, parent, "2026-07-10T03:00:00Z")
 }
 fn context() -> Value {
     json!({"timestamp":"2026-07-10T03:00:01Z","type":"turn_context","payload":{"model":"gpt-test"}})
@@ -79,6 +82,26 @@ fn tokens(input: u64, cached: u64, output: u64, sec: &str) -> Value {
 }
 const ID: &str = "00000000-0000-4000-8000-000000000001";
 const CHILD: &str = "00000000-0000-4000-8000-000000000002";
+const PAGE: &str = "00000000-0000-4000-8000-000000000003";
+
+fn cursor(f: &Fixture, path: &Path) -> (i64, Option<i64>, Option<i64>) {
+    Connection::open(&f.db)
+        .unwrap()
+        .query_row(
+            "SELECT last_line_offset,last_byte_offset,last_tail_fingerprint
+             FROM session_log_sync WHERE file_path=?1",
+            [path.to_string_lossy().as_ref()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap()
+}
+
+fn allow_mtime_recheck(f: &Fixture) {
+    Connection::open(&f.db)
+        .unwrap()
+        .execute("UPDATE session_log_sync SET last_modified=0", [])
+        .unwrap();
+}
 
 #[test]
 fn codex_incremental_import_is_idempotent_and_priced() {
@@ -344,4 +367,397 @@ fn symlinked_mirror_files_are_not_imported() {
     let result = ccr_importer::import(&f.db, "codex", &f.codex).unwrap();
     assert_eq!(result.imported, 0);
     assert_eq!(f.sql_i64("SELECT COUNT(*) FROM proxy_request_logs"), 0);
+}
+
+#[test]
+fn codex_cursor_is_inherited_after_archive_move_without_replaying_pruned_rows() {
+    let f = Fixture::new();
+    let original = f.codex_file(ID);
+    write_lines(
+        &original,
+        &[
+            meta(ID, None),
+            context(),
+            tokens(1000, 400, 100, "2026-07-10T03:00:02Z"),
+        ],
+    );
+    assert_eq!(
+        ccr_importer::import(&f.db, "codex", &f.codex)
+            .unwrap()
+            .imported,
+        1
+    );
+
+    // Simulate rollup/prune having removed the detailed rows. Request-id dedup can
+    // no longer hide a failure to inherit the cursor at the new path.
+    Connection::open(&f.db)
+        .unwrap()
+        .execute("DELETE FROM proxy_request_logs", [])
+        .unwrap();
+    fs::create_dir(f.codex.join("archived_sessions")).unwrap();
+    let archived = f
+        .codex
+        .join("archived_sessions")
+        .join(original.file_name().unwrap());
+    fs::rename(&original, &archived).unwrap();
+
+    let result = ccr_importer::import(&f.db, "codex", &f.codex).unwrap();
+    assert!(result.errors.is_empty(), "{:?}", result.errors);
+    assert_eq!(result.imported, 0);
+    assert_eq!(f.sql_i64("SELECT COUNT(*) FROM proxy_request_logs"), 0);
+    assert_eq!(cursor(&f, &archived).0, 3);
+}
+
+#[test]
+fn codex_cursor_survives_compression_and_decompression() {
+    let f = Fixture::new();
+    let plain = f.codex_file(ID);
+    write_lines(
+        &plain,
+        &[
+            meta(ID, None),
+            context(),
+            tokens(1000, 400, 100, "2026-07-10T03:00:02Z"),
+        ],
+    );
+    assert_eq!(
+        ccr_importer::import(&f.db, "codex", &f.codex)
+            .unwrap()
+            .imported,
+        1
+    );
+    Connection::open(&f.db)
+        .unwrap()
+        .execute("DELETE FROM proxy_request_logs", [])
+        .unwrap();
+
+    let compressed = plain.with_file_name(format!(
+        "{}.zst",
+        plain.file_name().unwrap().to_string_lossy()
+    ));
+    let bytes = fs::read(&plain).unwrap();
+    fs::write(
+        &compressed,
+        zstd::stream::encode_all(bytes.as_slice(), 3).unwrap(),
+    )
+    .unwrap();
+    fs::remove_file(&plain).unwrap();
+    let result = ccr_importer::import(&f.db, "codex", &f.codex).unwrap();
+    assert!(result.errors.is_empty(), "{:?}", result.errors);
+    assert_eq!(result.imported, 0);
+    assert_eq!(cursor(&f, &compressed).0, 3);
+    assert_eq!(f.sql_i64("SELECT COUNT(*) FROM proxy_request_logs"), 0);
+
+    let mut restored = zstd::stream::decode_all(fs::File::open(&compressed).unwrap()).unwrap();
+    restored.extend_from_slice(
+        format!("{}\n", tokens(1500, 500, 125, "2026-07-10T03:00:03Z")).as_bytes(),
+    );
+    fs::write(&plain, restored).unwrap();
+    fs::remove_file(&compressed).unwrap();
+    let result = ccr_importer::import(&f.db, "codex", &f.codex).unwrap();
+    assert!(result.errors.is_empty(), "{:?}", result.errors);
+    assert_eq!(result.imported, 1);
+    assert_eq!(f.sql_i64("SELECT COUNT(*) FROM proxy_request_logs"), 1);
+    assert_eq!(
+        f.sql_i64("SELECT input_tokens FROM proxy_request_logs"),
+        500
+    );
+    assert_eq!(cursor(&f, &plain).0, 4);
+}
+
+#[test]
+fn codex_continuation_inherits_previous_segment_high_water() {
+    let f = Fixture::new();
+    write_lines(
+        &f.codex_file(ID),
+        &[
+            meta(ID, None),
+            context(),
+            tokens(1000, 400, 100, "2026-07-10T03:00:02Z"),
+        ],
+    );
+    let continuation = f.codex.join(format!(
+        "sessions/2026/07/10/rollout-2026-07-10T03-10-00-{ID}_{PAGE}.jsonl"
+    ));
+    let mut continuation_meta = meta_at(ID, None, "2026-07-10T03:10:00Z");
+    continuation_meta["payload"]["history_mode"] = json!("paginated");
+    continuation_meta["payload"]["history_base"] = json!({"thread_id":ID});
+    write_lines(
+        &continuation,
+        &[
+            continuation_meta,
+            context(),
+            tokens(1500, 500, 125, "2026-07-10T03:10:02Z"),
+        ],
+    );
+
+    let result = ccr_importer::import(&f.db, "codex", &f.codex).unwrap();
+    assert!(result.errors.is_empty(), "{:?}", result.errors);
+    assert_eq!(result.deferred_files, 0);
+    assert_eq!(result.imported, 2);
+    assert_eq!(
+        f.sql_i64("SELECT SUM(input_tokens) FROM proxy_request_logs"),
+        1500
+    );
+    assert_eq!(
+        f.sql_i64("SELECT SUM(output_tokens) FROM proxy_request_logs"),
+        125
+    );
+}
+
+#[test]
+fn codex_parent_catch_up_retries_unchanged_child_and_skips_replayed_prefix() {
+    let f = Fixture::new();
+    let parent = f.codex_file(ID);
+    let child = f.codex_file(CHILD);
+    write_lines(
+        &parent,
+        &[
+            meta(ID, None),
+            context(),
+            tokens(1000, 400, 100, "2026-07-10T03:00:01Z"),
+        ],
+    );
+    write_lines(
+        &child,
+        &[
+            meta_at(CHILD, Some(ID), "2026-07-10T03:00:03Z"),
+            context(),
+            tokens(1000, 400, 100, "2026-07-10T03:00:03Z"),
+            tokens(1100, 450, 110, "2026-07-10T03:00:04Z"),
+        ],
+    );
+
+    let first = ccr_importer::import(&f.db, "codex", &f.codex).unwrap();
+    assert!(first.errors.is_empty(), "{:?}", first.errors);
+    assert_eq!(first.imported, 1);
+    assert_eq!(first.deferred_files, 1);
+    assert_eq!(f.sql_i64("SELECT COUNT(*) FROM proxy_request_logs"), 1);
+    assert_eq!(
+        f.sql_i64("SELECT COUNT(*) FROM session_log_sync WHERE file_path LIKE '%002.jsonl'"),
+        0
+    );
+
+    // Reach the fork cutoff without adding another parent token signature. The
+    // child itself is unchanged, so this also exercises dependency invalidation.
+    writeln!(
+        fs::OpenOptions::new().append(true).open(&parent).unwrap(),
+        "{}",
+        json!({"timestamp":"2026-07-10T03:00:03Z","type":"response_item","payload":{"type":"message","role":"user","content":[]}})
+    )
+    .unwrap();
+    let second = ccr_importer::import(&f.db, "codex", &f.codex).unwrap();
+    assert!(second.errors.is_empty(), "{:?}", second.errors);
+    assert_eq!(second.deferred_files, 0);
+    assert_eq!(second.imported, 1);
+    assert_eq!(f.sql_i64("SELECT COUNT(*) FROM proxy_request_logs"), 2);
+    assert_eq!(
+        f.sql_i64("SELECT SUM(input_tokens) FROM proxy_request_logs"),
+        1100
+    );
+    assert_eq!(
+        f.sql_i64("SELECT COUNT(*) FROM proxy_request_logs WHERE request_id LIKE '%002:1'"),
+        0
+    );
+    assert_eq!(
+        f.sql_i64("SELECT COUNT(*) FROM proxy_request_logs WHERE request_id LIKE '%002:2'"),
+        1
+    );
+}
+
+#[test]
+fn codex_second_batch_failure_rolls_back_cursor_and_retry_deduplicates_first_batch() {
+    let f = Fixture::new();
+    let file = f.codex_file(ID);
+    let mut lines = vec![meta(ID, None), context()];
+    lines.extend((0..1001).map(|i| tokens(1000 + i, 400, 100 + i, "2026-07-10T03:00:02Z")));
+    write_lines(&file, &lines);
+
+    let failing_request = format!("codex_session:thread-v1:{ID}:1001");
+    let conn = Connection::open(&f.db).unwrap();
+    conn.execute_batch(&format!(
+        "CREATE TRIGGER fail_second_codex_batch BEFORE INSERT ON proxy_request_logs
+         WHEN NEW.request_id='{failing_request}'
+         BEGIN SELECT RAISE(FAIL,'injected second-batch failure'); END;"
+    ))
+    .unwrap();
+    drop(conn);
+
+    let failed = ccr_importer::import(&f.db, "codex", &f.codex).unwrap();
+    assert_eq!(failed.errors.len(), 1, "{:?}", failed.errors);
+    assert!(failed.errors[0].contains("injected second-batch failure"));
+    assert_eq!(f.sql_i64("SELECT COUNT(*) FROM proxy_request_logs"), 1000);
+    assert_eq!(f.sql_i64("SELECT COUNT(*) FROM session_log_sync"), 0);
+
+    Connection::open(&f.db)
+        .unwrap()
+        .execute("DROP TRIGGER fail_second_codex_batch", [])
+        .unwrap();
+    let retried = ccr_importer::import(&f.db, "codex", &f.codex).unwrap();
+    assert!(retried.errors.is_empty(), "{:?}", retried.errors);
+    assert_eq!(retried.imported, 1);
+    assert_eq!(retried.skipped, 1000);
+    assert_eq!(f.sql_i64("SELECT COUNT(*) FROM proxy_request_logs"), 1001);
+    assert_eq!(
+        f.sql_i64("SELECT COUNT(DISTINCT request_id) FROM proxy_request_logs"),
+        1001
+    );
+    assert_eq!(cursor(&f, &file).0, 1003);
+}
+
+#[test]
+fn claude_rewrite_pins_cursor_to_eof_then_resumes_with_appends() {
+    let f = Fixture::new();
+    let file = f.claude.join("projects/project/session.jsonl");
+    let msg = |id, out| json!({"type":"assistant","timestamp":"2026-07-10T03:00:00Z","sessionId":"s1","message":{"id":id,"model":"claude-test","stop_reason":"end_turn","usage":{"input_tokens":100,"output_tokens":out,"cache_read_input_tokens":50,"cache_creation_input_tokens":10}}});
+    write_lines(&file, &[msg("msg-one", 20)]);
+    assert_eq!(
+        ccr_importer::import(&f.db, "claude", &f.claude)
+            .unwrap()
+            .imported,
+        1
+    );
+    assert_eq!(
+        cursor(&f, &file).1,
+        Some(fs::metadata(&file).unwrap().len() as i64)
+    );
+
+    // Same-length edit in the old prefix plus a new record: size-only append
+    // detection would accept this, but the tail fingerprint must reject it.
+    let original = fs::read_to_string(&file).unwrap();
+    let mut rewritten = original.replace("msg-one", "msg-old");
+    assert_eq!(rewritten.len(), original.len());
+    rewritten.push_str(&format!("{}\n", msg("msg-two", 30)));
+    fs::write(&file, rewritten).unwrap();
+    allow_mtime_recheck(&f);
+
+    let pinned = ccr_importer::import(&f.db, "claude", &f.claude).unwrap();
+    assert_eq!(pinned.imported, 0);
+    assert_eq!(pinned.errors.len(), 1, "{:?}", pinned.errors);
+    assert!(pinned.errors[0].contains("重写"));
+    assert_eq!(
+        cursor(&f, &file).1,
+        Some(fs::metadata(&file).unwrap().len() as i64)
+    );
+    assert_eq!(
+        f.sql_i64("SELECT COUNT(*) FROM proxy_request_logs WHERE request_id='session:msg-two'"),
+        0
+    );
+
+    writeln!(
+        fs::OpenOptions::new().append(true).open(&file).unwrap(),
+        "{}",
+        msg("msg-three", 40)
+    )
+    .unwrap();
+    let resumed = ccr_importer::import(&f.db, "claude", &f.claude).unwrap();
+    assert!(resumed.errors.is_empty(), "{:?}", resumed.errors);
+    assert_eq!(resumed.imported, 1);
+    assert_eq!(f.sql_i64("SELECT COUNT(*) FROM proxy_request_logs"), 2);
+    assert_eq!(
+        f.sql_i64("SELECT COUNT(*) FROM proxy_request_logs WHERE request_id IN ('session:msg-one','session:msg-three')"),
+        2
+    );
+}
+
+#[test]
+fn claude_incomplete_tail_is_not_fingerprinted_as_committed() {
+    let f = Fixture::new();
+    let file = f.claude.join("projects/project/session.jsonl");
+    let msg = |id, out| json!({"type":"assistant","timestamp":"2026-07-10T03:00:00Z","sessionId":"s1","message":{"id":id,"model":"claude-test","stop_reason":"end_turn","usage":{"input_tokens":100,"output_tokens":out,"cache_read_input_tokens":50,"cache_creation_input_tokens":10}}});
+    write_lines(&file, &[msg("tail-one", 10)]);
+    ccr_importer::import(&f.db, "claude", &f.claude).unwrap();
+    let initial = cursor(&f, &file);
+
+    write!(
+        fs::OpenOptions::new().append(true).open(&file).unwrap(),
+        "{}",
+        msg("tail-two", 20)
+    )
+    .unwrap();
+    let partial = ccr_importer::import(&f.db, "claude", &f.claude).unwrap();
+    assert!(partial.errors.is_empty(), "{:?}", partial.errors);
+    assert_eq!(partial.imported, 1);
+    assert_eq!(partial.deferred_files, 1);
+    assert_eq!(cursor(&f, &file), initial);
+
+    write!(
+        fs::OpenOptions::new().append(true).open(&file).unwrap(),
+        "\n{}\n",
+        msg("tail-three", 30)
+    )
+    .unwrap();
+    let completed = ccr_importer::import(&f.db, "claude", &f.claude).unwrap();
+    assert!(completed.errors.is_empty(), "{:?}", completed.errors);
+    assert_eq!(completed.imported, 1);
+    assert_eq!(completed.skipped, 1);
+    assert_eq!(f.sql_i64("SELECT COUNT(*) FROM proxy_request_logs"), 3);
+    assert_eq!(
+        f.sql_i64("SELECT COUNT(DISTINCT request_id) FROM proxy_request_logs"),
+        3
+    );
+    assert_eq!(
+        cursor(&f, &file).1,
+        Some(fs::metadata(&file).unwrap().len() as i64)
+    );
+}
+
+#[test]
+fn native_import_tolerates_a_real_concurrent_sqlite_writer() {
+    use std::sync::{Arc, Barrier};
+    use std::thread;
+
+    let f = Fixture::new();
+    let file = f.codex_file(ID);
+    let mut lines = vec![meta(ID, None), context()];
+    lines.extend((0..1001).map(|i| tokens(1000 + i, 400, 100 + i, "2026-07-10T03:00:02Z")));
+    write_lines(&file, &lines);
+    Connection::open(&f.db)
+        .unwrap()
+        .execute(
+            "CREATE TABLE concurrent_writes (id INTEGER PRIMARY KEY, value TEXT)",
+            [],
+        )
+        .unwrap();
+
+    let barrier = Arc::new(Barrier::new(2));
+    let writer_db = f.db.clone();
+    let writer_barrier = Arc::clone(&barrier);
+    let writer = thread::spawn(move || {
+        let conn = Connection::open(writer_db).unwrap();
+        conn.busy_timeout(std::time::Duration::from_secs(30))
+            .unwrap();
+        writer_barrier.wait();
+        for i in 0..32 {
+            conn.execute(
+                "INSERT INTO concurrent_writes(id,value) VALUES (?1,'written')",
+                [i],
+            )
+            .unwrap();
+        }
+    });
+    barrier.wait();
+    let imported = ccr_importer::import(&f.db, "codex", &f.codex).unwrap();
+    writer.join().unwrap();
+
+    assert!(imported.errors.is_empty(), "{:?}", imported.errors);
+    assert_eq!(imported.imported, 1001);
+    assert_eq!(f.sql_i64("SELECT COUNT(*) FROM proxy_request_logs"), 1001);
+    assert_eq!(f.sql_i64("SELECT COUNT(*) FROM concurrent_writes"), 32);
+    assert_eq!(
+        f.sql_i64("SELECT COUNT(DISTINCT request_id) FROM proxy_request_logs"),
+        1001
+    );
+    let integrity: String = Connection::open(&f.db)
+        .unwrap()
+        .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(integrity, "ok");
+    assert_eq!(
+        ccr_importer::import(&f.db, "codex", &f.codex)
+            .unwrap()
+            .imported,
+        0
+    );
+    assert_eq!(f.sql_i64("SELECT COUNT(*) FROM proxy_request_logs"), 1001);
 }

@@ -57,6 +57,10 @@ if [ "${FAKE_CC_FAIL_IMPORT:-}" = 1 ]; then
   printf 'database unavailable\ndatabase version: 23\ncheck for updates\n' >&2
   exit 1
 fi
+if [ "${FAKE_CC_WARN_IMPORT:-}" = 1 ]; then
+  echo '{"imported":1,"skipped":0,"filesScanned":1,"suspectedDuplicates":0,"deferredFiles":0,"errors":["bad.jsonl: unexpected EOF"]}'
+  exit 0
+fi
 echo '{"imported":1,"skipped":0,"filesScanned":1,"suspectedDuplicates":0,"deferredFiles":0,"errors":[]}'
 "#;
 
@@ -399,6 +403,33 @@ fn local_import_retries_without_ssh_or_advancing_the_pull_checkpoint() {
     assert_eq!(state["hosts"]["alpha"]["next_attempt"], 0);
     assert_eq!(state["hosts"]["alpha"]["last_imported"], 2);
     assert!(!sb.calls()[previous_calls..].contains("ssh "));
+}
+
+#[test]
+fn local_import_prunes_only_warning_free_successful_hosts() {
+    let sb = Sandbox::new("local-import-prune");
+    let mut stale = Vec::new();
+    for host in ["clean", "warning", "failed", "unselected"] {
+        let path = sb.root().join(format!("{host}/codex/sessions/old.jsonl"));
+        touch(&path, DAY * 30);
+        stale.push(path);
+    }
+
+    let clean = sb.ccr(&["import", "clean"], &[]);
+    assert!(clean.status.success(), "{}", text(&clean));
+    let warning = sb.ccr(&["import", "warning"], &[("FAKE_CC_WARN_IMPORT", "1")]);
+    assert!(warning.status.success(), "{}", text(&warning));
+    let failed = sb.ccr(&["import", "failed"], &[("FAKE_CC_FAIL_IMPORT", "1")]);
+    assert!(!failed.status.success());
+
+    assert!(!stale[0].exists(), "干净的本地导入应清理过期镜像");
+    for (host, path) in ["warning", "failed", "unselected"]
+        .into_iter()
+        .zip(&stale[1..])
+    {
+        assert!(path.exists(), "{host} 的过期镜像必须保留");
+    }
+    assert!(!sb.calls().contains("ssh "));
 }
 
 #[test]

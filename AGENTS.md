@@ -26,7 +26,7 @@ cc-remote-usage/
 │   ├── ssh.rs              # 统一 ssh 参数（-T / RemoteCommand=none / BatchMode）与 stderr 摘要
 │   ├── sync.rs             # tar-over-SSH 增量拉取 + 按 app 导入
 │   ├── importer.rs         # 导入器选择、数据库或 CLI 版本预检
-│   ├── import_cmd.rs       # 只重试本地镜像导入，保持远端拉取断点
+│   ├── import_cmd.rs       # 重试本地镜像导入，成功后清理，保持远端拉取断点
 │   ├── extra_sources.rs    # 用户显式配置的额外 Codex 日志、首次回补、浅层镜像
 │   ├── mirror.rs           # 镜像保留期清理
 │   ├── report.rs           # 会话日志解析与去重、model-pricing 计价、表格/JSON 输出
@@ -91,7 +91,7 @@ ccr daemon install --interval 900
 15. 主机名同时是 ssh 参数和镜像目录名，入口处用 `hosts::valid_host_id` 校验。
 16. `cc_switch_version` 是用户确认兼容后锁定的 CLI 版本；CLI 后端必须在探测/拉取前检查。
     配置解析失败时整轮停止，不能回退到默认配置绕过锁定。
-17. `ccr import` 与同步共用运行锁，只重试已有镜像，成功也不能推进 `last_epoch`。
+17. `ccr import` 与同步共用运行锁，只重试已有镜像，成功也不能推进 `last_epoch`；只清理本轮导入成功且无暂缓/警告的点名主机，失败及未点名主机不动。
 18. 普通同步与本地导入只要有主机失败，就返回非零退出码，`--quiet` 同样适用。
 19. 额外 Codex 目录必须由用户通过 `--add-codex-root 主机=绝对路径` 显式配置，默认不开启。
     只传输 `sessions` / `archived_sessions` 下的 JSONL，不传输 auth/config；跳过材料副本。
