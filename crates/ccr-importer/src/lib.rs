@@ -59,14 +59,21 @@ fn real_file(path: &Path) -> bool {
     std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_file())
 }
 
-/// Only the schema audited against the extracted desktop implementation is supported.
-const SUPPORTED_SCHEMA: i64 = 23;
+/// Only schemas audited against the desktop implementation are supported.
+///
+/// - 23: desktop v4.0.21, the release these routines were extracted from.
+/// - 24: desktop v4.0.22–v4.0.26. The migration only adds columns: `enabled_dsh` on
+///   `mcp_servers` / `skills` (never touched here) and the nullable DeepSeek Harness
+///   parser context `session_log_sync.parser_state`. Upstream still writes Codex and
+///   Claude cursors without `parser_state`, exactly like these routines.
+const SUPPORTED_SCHEMAS: [i64; 2] = [23, 24];
 
 fn check_schema(conn: &rusqlite::Connection) -> Result<(), AppError> {
     let version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
-    if version != SUPPORTED_SCHEMA {
+    if !SUPPORTED_SCHEMAS.contains(&version) {
+        let supported = SUPPORTED_SCHEMAS.map(|v| v.to_string()).join("、");
         return Err(AppError::Database(format!(
-            "数据库 schema {version} 与本导入器支持的 schema {SUPPORTED_SCHEMA} 不匹配"
+            "数据库 schema {version} 与本导入器支持的 schema {supported} 不匹配"
         )));
     }
     // Prepare all required tables before any import can modify data.
@@ -77,6 +84,15 @@ fn check_schema(conn: &rusqlite::Connection) -> Result<(), AppError> {
         "SELECT data_source, request_id, semantic_id, has_entry_id FROM session_usage_dedup LIMIT 0",
     ] {
         conn.prepare(sql)?;
+    }
+    // A schema 24 database is only the audited one when it carries the column added by v24.
+    if version >= 24 {
+        conn.prepare("SELECT parser_state FROM session_log_sync LIMIT 0")
+            .map_err(|e| {
+                AppError::Database(format!(
+                    "schema {version} 数据库缺少 session_log_sync.parser_state 列，与已审计的结构不符：{e}"
+                ))
+            })?;
     }
     Ok(())
 }

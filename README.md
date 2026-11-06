@@ -55,7 +55,7 @@ ccr config --set-hosts netcup,frankie-vps   # 固定默认主机（不再交互�
 ccr config --set-days 3                     # 首次回溯天数
 ccr config --set-backoff 15,360             # 退避：基础 15 分钟，上限 6 小时
 ccr config --set-retain-days 7              # 镜像保留天数（0 = 不清理）
-ccr config --set-importer native            # 使用内置导入器（目前支持数据库 schema 23）
+ccr config --set-importer native            # 使用内置导入器（目前支持数据库 schema 23、24）
 ccr config --set-importer cc-switch         # 切回 CC Switch CLI
 ccr config --pin-cc-switch                 # 锁定当前安装的 CLI 版本
 ccr config --unpin-cc-switch               # 取消版本锁定
@@ -87,8 +87,10 @@ ccr config --clear-codex-roots server
 
 内置导入器参考 CC Switch 桌面版 v4.0.21 的会话导入实现，支持 Codex / Claude，
 直接将用量与游标写入已有的 CC Switch 数据库，使用 SQLite 事务，不创建或迁移数据库。
-它只接受经过验证的 schema 23；数据库版本不匹配时在 SSH 探测之前停止。数据库默认位于
-`~/.cc-switch/cc-switch.db`，设置 `CC_SWITCH_CONFIG_DIR` 时使用该目录下的数据库。
+它只接受对照上游审计过的 schema 23、24（桌面版 v4.0.21–v4.0.26）；数据库版本不匹配时在 SSH
+探测之前停止。数据库默认位于 `~/.cc-switch/cc-switch.db`，设置 `CC_SWITCH_CONFIG_DIR` 时使用该目录下的数据库。
+桌面版升级到新 schema 后，定时任务每轮都会在预检处停下，错误只记在 `ccr daemon status` 显示的
+日志里；拉取断点不会推进，升级到支持新 schema 的 `ccr` 后，下一轮同步会补齐期间的日志。
 源代码及 MIT 版权信息见 [内置导入器](crates/ccr-importer/UPSTREAM-LICENSE)。
 现有安装默认仍用原 CLI 后端，运行 `ccr config --set-importer native` 显式切换。
 

@@ -66,7 +66,8 @@ ccr daemon install --interval 900
 
 ## 关键不变量（改动前务必确认）
 
-1. 内置导入器只支持已验证的 schema 23，预检必须先于探测/拉取；不得创建、迁移数据库或绕过 schema 校验。遵守上游去重、计价、事务和游标契约，数据库写入失败不得推进游标或拉取断点。CLI 后端继续走 `cc-switch sessions sync-usage`。
+1. 内置导入器只支持已对照上游审计过的 schema 23、24（24 必须带 `session_log_sync.parser_state` 列），预检必须先于探测/拉取；
+   放行新 schema 前要对照该版桌面端的迁移与导入/去重/游标代码，并在真实库快照上跑隔离对照（见 `docs/开发记录.md`）；不得创建、迁移数据库或绕过 schema 校验。遵守上游去重、计价、事务和游标契约，数据库写入失败不得推进游标或拉取断点。CLI 后端继续走 `cc-switch sessions sync-usage`。
 2. **`last_epoch` 只在成功时推进**；失败推进会导致增量窗口漏文件。
 3. **退避状态与同步状态同存 `state.json`**，`record_failure` 只累加不覆盖 `last_epoch`。
 4. **命令行点名的主机必须无视冷却**（用户明确要求重试），`--force` / `--retry-now` 同理。
@@ -123,6 +124,7 @@ ccr daemon install --interval 900
 | 本机 `find` 测试结论与远端不符 | Claude Code 的 shell 把 `find` 包成了 bfs | 验证 BSD 行为用 `/usr/bin/find` 或 `sh -c` |
 | 某台机器不再有数据，别的主机也跟着停了 | 远端命令被杀 → ssh 通道半死不关，本地 tar 死等 EOF，占着运行锁 | 传输停滞检测（无新数据即中止），见不变量 20 |
 | 磁盘被 `.extra-codex-*` 目录吃满 | 上一轮被杀留下暂存目录没人回收 | 每轮开始先清残留（运行锁保证没有并发同步） |
+| 看板好几天没有服务器用量，`ccr status` 却只显示旧的成功时间 | 桌面版升级把数据库迁到新 schema，内置导入器预检拒绝，整轮在探测前退出 | `ccr daemon status` 看 `launchd.err.log`；对照上游审计新 schema 后再放行，断点没推进，升级后自动补齐 |
 
 ## 安装方式
 

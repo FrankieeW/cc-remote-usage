@@ -163,11 +163,104 @@ fn schema_mismatch_and_write_errors_do_not_advance_cursor() {
         ],
     );
     let c = Connection::open(&f.db).unwrap();
-    c.execute_batch("PRAGMA user_version=24;").unwrap();
-    assert!(ccr_importer::import(&f.db, "codex", &f.codex).is_err());
+    for unsupported in [22, 25] {
+        c.execute_batch(&format!("PRAGMA user_version={unsupported};"))
+            .unwrap();
+        let err = ccr_importer::preflight(&f.db).unwrap_err().to_string();
+        assert!(err.contains(&format!("schema {unsupported}")), "{err}");
+        assert!(ccr_importer::import(&f.db, "codex", &f.codex).is_err());
+    }
     c.execute_batch("PRAGMA user_version=23; CREATE TRIGGER reject_import BEFORE INSERT ON proxy_request_logs BEGIN SELECT RAISE(FAIL,'blocked'); END;").unwrap();
     let r = ccr_importer::import(&f.db, "codex", &f.codex).unwrap();
     assert!(!r.errors.is_empty());
+    assert_eq!(f.sql_i64("SELECT COUNT(*) FROM session_log_sync"), 0);
+    assert_eq!(f.sql_i64("SELECT COUNT(*) FROM proxy_request_logs"), 0);
+}
+
+/// Desktop v4.0.22 migration 23 → 24 as far as the importer's tables are concerned:
+/// `session_log_sync` only gains the nullable DSH parser context column.
+fn upgrade_to_schema_24(db: &Path) {
+    Connection::open(db)
+        .unwrap()
+        .execute_batch(
+            "ALTER TABLE session_log_sync ADD COLUMN parser_state TEXT;
+             PRAGMA user_version=24;",
+        )
+        .unwrap();
+}
+
+#[test]
+fn schema_24_imports_both_apps_without_touching_desktop_parser_state() {
+    let f = Fixture::new();
+    upgrade_to_schema_24(&f.db);
+    // A cursor owned by the desktop DeepSeek Harness importer must survive our writes.
+    Connection::open(&f.db)
+        .unwrap()
+        .execute_batch(
+            "INSERT INTO session_log_sync
+               (file_path, last_modified, last_line_offset, last_synced_at, last_byte_offset, parser_state)
+             VALUES ('dsh:/sessions/a.jsonl', 1, 0, 1, 42, '{\"pending\":true}');",
+        )
+        .unwrap();
+    ccr_importer::preflight(&f.db).unwrap();
+    write_lines(
+        &f.codex_file(ID),
+        &[
+            meta(ID, None),
+            context(),
+            tokens(1000, 400, 100, "2026-07-10T03:00:02Z"),
+        ],
+    );
+    write_lines(
+        &f.claude.join("projects/project/session.jsonl"),
+        &[
+            json!({"type":"assistant","timestamp":"2026-07-10T03:00:00Z","sessionId":"s1","message":{"id":"msg-v24","model":"claude-test","stop_reason":"end_turn","usage":{"input_tokens":100,"output_tokens":20,"cache_read_input_tokens":50,"cache_creation_input_tokens":10}}}),
+        ],
+    );
+    for (app, mirror) in [("codex", &f.codex), ("claude", &f.claude)] {
+        let r = ccr_importer::import(&f.db, app, mirror).unwrap();
+        assert!(r.errors.is_empty(), "{app}: {:?}", r.errors);
+        assert_eq!(r.imported, 1, "{app}");
+        let again = ccr_importer::import(&f.db, app, mirror).unwrap();
+        assert_eq!(again.imported, 0, "{app} must stay idempotent");
+    }
+    assert_eq!(f.sql_i64("SELECT COUNT(*) FROM proxy_request_logs"), 2);
+    assert!(
+        f.sql_i64("SELECT COUNT(*) FROM session_log_sync WHERE file_path NOT LIKE 'dsh:%'") >= 2
+    );
+    assert_eq!(
+        f.sql_i64("SELECT COUNT(*) FROM session_log_sync WHERE file_path NOT LIKE 'dsh:%' AND parser_state IS NOT NULL"),
+        0
+    );
+    let kept: (i64, String) = Connection::open(&f.db)
+        .unwrap()
+        .query_row(
+            "SELECT last_byte_offset, parser_state FROM session_log_sync WHERE file_path='dsh:/sessions/a.jsonl'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(kept, (42, "{\"pending\":true}".to_string()));
+}
+
+#[test]
+fn schema_24_without_parser_state_is_not_the_audited_schema() {
+    let f = Fixture::new();
+    write_lines(
+        &f.codex_file(ID),
+        &[
+            meta(ID, None),
+            context(),
+            tokens(1000, 400, 100, "2026-07-10T03:00:02Z"),
+        ],
+    );
+    Connection::open(&f.db)
+        .unwrap()
+        .execute_batch("PRAGMA user_version=24;")
+        .unwrap();
+    let err = ccr_importer::preflight(&f.db).unwrap_err().to_string();
+    assert!(err.contains("parser_state"), "{err}");
+    assert!(ccr_importer::import(&f.db, "codex", &f.codex).is_err());
     assert_eq!(f.sql_i64("SELECT COUNT(*) FROM session_log_sync"), 0);
     assert_eq!(f.sql_i64("SELECT COUNT(*) FROM proxy_request_logs"), 0);
 }
