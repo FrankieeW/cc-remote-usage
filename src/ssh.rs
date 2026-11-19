@@ -1,6 +1,7 @@
 //! 统一的 ssh 调用参数与错误摘要。
 
 use std::io::{self, ErrorKind, Read, Write};
+use std::os::unix::process::CommandExt;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
@@ -50,6 +51,7 @@ pub fn command(host: &str, t: &Timeouts) -> Command {
 /// stderr 总是管道，调用方负责读取（或用 `wait_with_output`）。
 pub fn spawn_script(host: &str, t: &Timeouts, script: &str, stdout: Stdio) -> io::Result<Child> {
     let mut child = command(host, t)
+        .process_group(0)
         .args(["sh", "-s"])
         .stdin(Stdio::piped())
         .stdout(stdout)

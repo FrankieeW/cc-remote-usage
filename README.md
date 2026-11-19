@@ -190,9 +190,7 @@ CLI 意外升级，不会自动判断桌面版与数据库是否兼容。
   定价表里没有的模型记 `n/a`（CC Switch 看板里也是 0）。
 - **归属**：CC Switch 把所有会话解析出的用量归到 `_codex_session` / `_session` 这类伪供应商，
   不区分是哪台服务器。要看按服务器拆分用 `ccr report`。
-- **请求数口径**：Claude Code 把一次响应的每个内容块（thinking / text / tool_use）各写一行，
-  `ccr report` 按 `message.id` 去重（Codex 按 `response_id`），与看板一致。
-- **磁盘**：成功导入且没有暂缓或警告的主机，其镜像清理 7 天未更新的文件（`ccr config --set-retain-days`）；仍在进行的 Codex 子代理会话
-  的父会话链会一并保留（CC Switch 导入子会话需要它）；`config.json` 写坏时本轮不清理。
+- **请求数口径**：Claude 按 `message.id` 合并，优先采用带 `stop_reason` 的用量块，同等条件取较大的输出 Token 数。Codex 把 `token_count` 快照换算成单次请求用量，与对应的 `token_usage_record` 只计一次。
+- **磁盘**：主机成功导入且没有暂缓或警告后，只清理当前导入器扫描范围内超过保留期的日志（默认 7 天，`ccr config --set-retain-days` 可调）。扫描范围外的镜像和仍有子会话依赖的 Codex 父会话链会保留。Claude 日志末行尚未写完时，内置导入器会继续报告暂缓。
   `report --days` 超过保留期时更早的数据可能不全，报告里会提示。首次全量可能较大（如 3 天 41 个 Codex rollout ≈ 228MB 压缩后）。
 - 服务器时钟与本地时区不一致时，"今日"归属按会话里记录的时间戳换算成本地时间。

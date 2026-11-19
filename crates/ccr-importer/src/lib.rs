@@ -48,8 +48,12 @@ mod services {
 
 use database::Database;
 pub use error::AppError;
-pub use services::session_usage::SessionSyncResult;
+pub use services::session_usage::{collect_claude_session_files, SessionSyncResult};
+pub use services::session_usage_codex::{scan_codex_report, CodexReportUsage};
 use std::path::Path;
+
+/// Maximum number of nested directories scanned below `codex/sessions`.
+pub const CODEX_SESSION_MAX_DEPTH: u32 = 3;
 
 fn real_dir(path: &Path) -> bool {
     std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_dir())
