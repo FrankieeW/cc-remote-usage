@@ -43,6 +43,5 @@ and isolated database parity tests before adding support for a new schema.
 
 Schemas 25–27 do not change `proxy_request_logs`, `session_log_sync`,
 `model_pricing`, or `session_usage_dedup`. The same `parser_state` check used for
-schema 24 applies. Codex 0.167+ ordinal forks (`verified_ordinal_fork`) are not
-ported; port them together with `history_base` if servers start producing those
-forks.
+schema 24 applies. The Codex 0.167+ ordinal fork check follows v4.0.35.
+A verified child imports its own per-request usage even when the parent is idle.

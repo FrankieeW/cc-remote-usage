@@ -147,6 +147,32 @@ fn codex_incremental_import_is_idempotent_and_priced() {
 }
 
 #[test]
+fn ordinal_fork_only_imports_verified_post_cutoff_usage() {
+    for (ordinal, timestamp, expected) in [
+        (5, "2026-07-10T03:00:02Z", 1),
+        (0, "2026-07-10T03:00:02Z", 0),
+        (5, "2026-07-10T03:00:00Z", 0),
+    ] {
+        let fixture = Fixture::new();
+        let mut root = meta(CHILD, Some(ID));
+        root["ordinal"] = json!(ordinal);
+        root["payload"]["forked_from_ordinal_exclusive"] = json!(5);
+        let mut event = tokens(1000, 400, 100, timestamp);
+        event["payload"]["info"]["last_token_usage"] =
+            json!({"input_tokens": 10, "output_tokens": 2});
+        write_lines(&fixture.codex_file(CHILD), &[root, context(), event]);
+        let result = ccr_importer::import(&fixture.db, "codex", &fixture.codex).unwrap();
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        assert_eq!(result.imported, expected);
+        assert_eq!(result.deferred_files, 1 - expected);
+        assert_eq!(
+            fixture.sql_i64("SELECT COALESCE(SUM(input_tokens),0) FROM proxy_request_logs"),
+            i64::from(expected) * 10
+        );
+    }
+}
+
+#[test]
 fn missing_parent_is_deferred_until_parent_arrives() {
     let f = Fixture::new();
     write_lines(
