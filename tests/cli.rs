@@ -842,6 +842,53 @@ fn failed_import_preserves_old_mirror_files_for_retry() {
 }
 
 #[test]
+fn native_sync_reports_bad_file_and_imports_healthy_usage() {
+    let sb = Sandbox::new("native-sync-warning");
+    seed_remote(&sb, "alpha");
+    let db_dir = native_database(&sb, 23);
+    fs::write(
+        sb.root().join("config.json"),
+        r#"{"import_backend":"native"}"#,
+    )
+    .unwrap();
+    let bad = sb.root().join("alpha/codex/sessions/rollout-bad.jsonl.zst");
+    fs::create_dir_all(bad.parent().unwrap()).unwrap();
+    fs::write(&bad, b"invalid compressed data").unwrap();
+    let stale = sb.root().join("alpha/codex/sessions/old.jsonl");
+    touch(&stale, DAY * 30);
+    let message = serde_json::json!({"type":"assistant","timestamp":"2026-07-10T03:00:00Z","sessionId":"s1","message":{"id":"msg-ok","model":"claude-test","stop_reason":"end_turn","usage":{"input_tokens":100,"output_tokens":20}}});
+    fs::write(
+        sb.remote("alpha").join(".claude/projects/p/s.jsonl"),
+        format!("{message}\n"),
+    )
+    .unwrap();
+
+    let out = sb.ccr(
+        &["sync", "alpha"],
+        &[("CC_SWITCH_CONFIG_DIR", db_dir.to_str().unwrap())],
+    );
+    assert!(out.status.success(), "{}", text(&out));
+    assert!(
+        text(&out).contains("rollout-bad.jsonl.zst"),
+        "{}",
+        text(&out)
+    );
+    let host = &sb.state()["hosts"]["alpha"];
+    assert_eq!(host["failures"], 0);
+    assert!(host["last_epoch"].as_i64().unwrap() > 0);
+    assert!(stale.exists());
+    let conn = rusqlite::Connection::open(db_dir.join("cc-switch.db")).unwrap();
+    let count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM proxy_request_logs WHERE request_id='session:msg-ok'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(count, 1);
+}
+
+#[test]
 fn native_import_failure_does_not_advance_checkpoint_or_prune() {
     let sb = Sandbox::new("native-import-failure");
     seed_remote(&sb, "alpha");

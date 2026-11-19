@@ -194,8 +194,8 @@ fn schema_mismatch_and_write_errors_do_not_advance_cursor() {
         assert!(ccr_importer::import(&f.db, "codex", &f.codex).is_err());
     }
     c.execute_batch("PRAGMA user_version=23; CREATE TRIGGER reject_import BEFORE INSERT ON proxy_request_logs BEGIN SELECT RAISE(FAIL,'blocked'); END;").unwrap();
-    let r = ccr_importer::import(&f.db, "codex", &f.codex).unwrap();
-    assert!(!r.errors.is_empty());
+    let err = ccr_importer::import(&f.db, "codex", &f.codex).unwrap_err();
+    assert!(err.to_string().contains("blocked"), "{err}");
     assert_eq!(f.sql_i64("SELECT COUNT(*) FROM session_log_sync"), 0);
     assert_eq!(f.sql_i64("SELECT COUNT(*) FROM proxy_request_logs"), 0);
 }
@@ -583,9 +583,11 @@ fn codex_second_batch_failure_rolls_back_cursor_and_retry_deduplicates_first_bat
     .unwrap();
     drop(conn);
 
-    let failed = ccr_importer::import(&f.db, "codex", &f.codex).unwrap();
-    assert_eq!(failed.errors.len(), 1, "{:?}", failed.errors);
-    assert!(failed.errors[0].contains("injected second-batch failure"));
+    let err = ccr_importer::import(&f.db, "codex", &f.codex).unwrap_err();
+    assert!(
+        err.to_string().contains("injected second-batch failure"),
+        "{err}"
+    );
     assert_eq!(f.sql_i64("SELECT COUNT(*) FROM proxy_request_logs"), 1000);
     assert_eq!(f.sql_i64("SELECT COUNT(*) FROM session_log_sync"), 0);
 

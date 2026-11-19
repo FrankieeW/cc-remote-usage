@@ -938,7 +938,13 @@ pub fn sync_codex_usage(db: &Database, codex_dir: &Path) -> Result<SessionSyncRe
                     result.deferred_files = result.deferred_files.saturating_add(1);
                 }
             }
-            Err(e) => {
+            Err(AppError::Database(reason)) => {
+                return Err(AppError::Database(format!(
+                    "{}: {reason}",
+                    file_path.display()
+                )));
+            }
+            Err(e @ AppError::Config(_)) => {
                 let msg = format!("Codex 会话文件解析失败 {}: {e}", file_path.display());
                 log::warn!("[CODEX-SYNC] {msg}");
                 result.errors.push(msg);

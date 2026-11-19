@@ -361,7 +361,13 @@ pub fn sync_claude_session_logs(
                     ));
                 }
             }
-            Err(e) => {
+            Err(AppError::Database(reason)) => {
+                return Err(AppError::Database(format!(
+                    "{}: {reason}",
+                    file_path.display()
+                )));
+            }
+            Err(e @ AppError::Config(_)) => {
                 let msg = format!("{}: {e}", file_path.display());
                 log::warn!("[SESSION-SYNC] 文件解析失败: {msg}");
                 result.errors.push(msg);

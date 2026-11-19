@@ -249,9 +249,6 @@ fn run(cli: Cli) -> Result<()> {
             mirror,
         } => {
             let result = ccr_importer::import(&database, &app, &mirror)?;
-            if !result.errors.is_empty() {
-                bail!("{}", result.errors.join("；"));
-            }
             println!("{}", serde_json::to_string(&result)?);
             Ok(())
         }
