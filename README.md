@@ -1,5 +1,7 @@
 # ccr — 服务器 agent 用量 → CC Switch 统一看板
 
+[English](README.en.md)
+
 [![release](https://github.com/FrankieeW/cc-remote-usage/actions/workflows/release.yml/badge.svg)](https://github.com/FrankieeW/cc-remote-usage/actions/workflows/release.yml)
 
 CC Switch 的「用量」看板只扫**本机**的会话日志（`~/.codex/sessions`、`~/.claude/projects`，受
