@@ -19,6 +19,7 @@ chrono = "0.4"
 dialoguer = "0.12"
 sha2 = "0.10"
 tempfile = "3"
+rustix = { version = "1", features = ["process"] }
 ccr-importer = { path = "crates/ccr-importer" }
 
 [dev-dependencies]

@@ -5,8 +5,9 @@ use crate::{importer::Importer, ssh};
 use anyhow::{bail, Context, Result};
 use std::fs;
 use std::io::{Read, Write};
+use std::os::unix::process::CommandExt;
 use std::path::Path;
-use std::process::{Command, ExitStatus, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -123,15 +124,22 @@ fn fail(host: &str, msg: String) -> Outcome {
 fn remote_pull_script(remote_sub: &str, since: i64, now: i64) -> String {
     let since = (since - OVERLAP_SECS).max(0);
     let minutes = (now - since).max(60) / 60 + 1;
+    let (app, logs) = remote_sub.split_once('/').expect("app/logs path");
     format!(
-        r#"empty() {{ printf '' | tar -czf - -T - 2>/dev/null; }}
-d="$HOME/{remote_sub}"
-[ -d "$d" ] && cd "$d" 2>/dev/null || {{ empty; exit 0; }}
+        r#"cd "$HOME" || exit 1
+for d in '{app}' '{logs}'; do
+  if [ ! -e "$d" ] && [ ! -L "$d" ]; then exec tar -czf - -T /dev/null; fi
+  cd "./$d" || exit 1
+done
+list=$(mktemp "${{TMPDIR:-/tmp}}/ccr-pull.XXXXXX") || exit 1
+trap 'rm -f "$list"' 0
+trap 'exit 1' 1 2 15
 if find . -maxdepth 0 -newermt '@0' >/dev/null 2>&1; then
-  find . -type f -name '*.jsonl' -newermt '@{since}' 2>/dev/null
+  find . -type f -name '*.jsonl' -newermt '@{since}' -print0
 else
-  find . -type f -name '*.jsonl' -mmin -{minutes} 2>/dev/null
-fi | tar -czf - -T -
+  find . -type f -name '*.jsonl' -mmin -{minutes} -print0
+fi > "$list" || exit $?
+tar -czf - --null -T "$list"
 rc=$?
 if [ "$rc" -eq 1 ] && tar --version 2>/dev/null | grep -q 'GNU tar'; then exit 0; fi
 exit "$rc"
@@ -245,6 +253,25 @@ fn pull(host: &str, remote_sub: &str, since: i64, local: &Path) -> Result<()> {
     pull_archive(host, &remote, local)
 }
 
+// WNOWAIT keeps the local process group IDs reserved until teardown, even if
+// a wrapper exits before its children close their inherited pipes.
+fn transfer_exited(child: &Child) -> std::io::Result<Option<bool>> {
+    use rustix::process::{waitid, Pid, WaitId, WaitIdOptions};
+    let flags = WaitIdOptions::EXITED | WaitIdOptions::NOHANG | WaitIdOptions::NOWAIT;
+    loop {
+        match waitid(WaitId::Pid(Pid::from_child(child)), flags) {
+            Ok(status) => return Ok(status.map(|s| s.exit_status() == Some(0))),
+            Err(rustix::io::Errno::INTR) => continue,
+            Err(e) => return Err(e.into()),
+        }
+    }
+}
+
+fn stop_transfer_group(child: &Child) {
+    use rustix::process::{kill_process_group, Pid, Signal};
+    let _ = kill_process_group(Pid::from_child(child), Signal::KILL);
+}
+
 pub(crate) fn pull_archive(host: &str, remote: &str, local: &Path) -> Result<()> {
     let limits = TransferLimits::default();
     let mut ssh = ssh::spawn_script(host, &ssh::TRANSFER, remote, Stdio::piped())
@@ -256,6 +283,7 @@ pub(crate) fn pull_archive(host: &str, remote: &str, local: &Path) -> Result<()>
     let stderr_reader = thread::spawn(move || ssh::read_tail(stderr, 64 * 1024));
 
     let mut tar = match Command::new("tar")
+        .process_group(0)
         .arg("xzf")
         .arg("-")
         .arg("-C")
@@ -267,23 +295,19 @@ pub(crate) fn pull_archive(host: &str, remote: &str, local: &Path) -> Result<()>
     {
         Ok(t) => t,
         Err(e) => {
-            let _ = ssh.kill();
+            stop_transfer_group(&ssh);
             let _ = ssh.wait();
             return Err(e).context("本地 tar 运行失败");
         }
     };
     let tar_stdin = tar.stdin.take().context("无法获取 tar stdin")?;
-    let mut tar_stderr = tar.stderr.take().context("无法获取 tar stderr")?;
-    let tar_err_reader = thread::spawn(move || {
-        let mut buf = Vec::new();
-        let _ = tar_stderr.read_to_end(&mut buf);
-        String::from_utf8_lossy(&buf).into_owned()
-    });
+    let tar_stderr = tar.stderr.take().context("无法获取 tar stderr")?;
+    let tar_err_reader = thread::spawn(move || ssh::read_tail(tar_stderr, 64 * 1024));
 
     // ssh stdout → tar stdin 之间插一层泵：边转发边数字节。
     // 以前直接把 ssh 的 stdout 当 tar 的 stdin，远端命令被杀后管道永远等不到 EOF，
     // 只能等满 60 分钟的总时长上限才收场——整轮同步和后续定时任务全被它拖住。
-    let (tx, rx) = mpsc::channel::<u64>();
+    let (tx, rx) = mpsc::sync_channel(1);
     let pump = thread::spawn(move || {
         let mut src = stdout;
         let mut dst = tar_stdin;
@@ -292,9 +316,7 @@ pub(crate) fn pull_archive(host: &str, remote: &str, local: &Path) -> Result<()>
             match src.read(&mut buf) {
                 Ok(0) => break,
                 Ok(n) => {
-                    if tx.send(n as u64).is_err() {
-                        break;
-                    }
+                    let _ = tx.try_send(());
                     if dst.write_all(&buf[..n]).is_err() {
                         break;
                     }
@@ -304,76 +326,60 @@ pub(crate) fn pull_archive(host: &str, remote: &str, local: &Path) -> Result<()>
         }
     });
 
-    let watchdog = ssh::Watchdog::arm(ssh.id(), TRANSFER_TIMEOUT);
+    let started = Instant::now();
     let mut progress = Progress::new(limits);
-    let mut pump_done = false;
-    let mut stalled = false;
-    let tar_status: Option<ExitStatus>;
-
-    // 等 tar 收尾，同时盯着字节流还有没有在动
-    loop {
-        match tar.try_wait() {
-            Ok(Some(status)) => {
-                tar_status = Some(status);
-                break;
+    let supervision = (|| -> Result<bool> {
+        loop {
+            let ssh_ok = transfer_exited(&ssh)?;
+            let tar_ok = transfer_exited(&tar)?;
+            if ssh_ok == Some(false) || tar_ok == Some(false) {
+                return Ok(false);
             }
-            Ok(None) => {}
-            Err(e) => {
-                let _ = ssh.kill();
-                let _ = ssh.wait();
-                watchdog.disarm();
-                let _ = pump.join();
-                let _ = tar_err_reader.join();
-                return Err(e).context("等待本地 tar 失败");
+            if ssh_ok.is_some()
+                && tar_ok.is_some()
+                && pump.is_finished()
+                && stderr_reader.is_finished()
+                && tar_err_reader.is_finished()
+            {
+                return Ok(true);
             }
-        }
-        if pump_done {
-            thread::sleep(Duration::from_secs(1));
-        } else {
-            match rx.recv_timeout(Duration::from_secs(1)) {
-                Ok(_) => {
-                    progress.note();
-                    continue;
-                }
+            if started.elapsed() >= TRANSFER_TIMEOUT {
+                bail!("传输超过 {} 分钟仍未完成", TRANSFER_TIMEOUT.as_secs() / 60);
+            }
+            let Some(remaining) = progress.remaining() else {
+                bail!(
+                    "传输停滞：{} 秒没有收到新数据（下轮重试）",
+                    progress.limit().as_secs()
+                );
+            };
+            let tick = remaining.min(Duration::from_millis(50));
+            match rx.recv_timeout(tick) {
+                Ok(()) => progress.note(),
+                Err(mpsc::RecvTimeoutError::Disconnected) => thread::sleep(tick),
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
-                Err(mpsc::RecvTimeoutError::Disconnected) => pump_done = true,
             }
         }
-        if progress.remaining().is_none() {
-            // 停滞：远端命令多半已经被杀了，但 ssh 通道不会关闭
-            stalled = true;
-            let _ = ssh.kill();
-            tar_status = tar.wait().ok();
-            break;
-        }
+    })();
+    if !matches!(supervision, Ok(true)) {
+        stop_transfer_group(&ssh);
+        stop_transfer_group(&tar);
     }
-
-    let timed_out = watchdog.disarm();
     let ssh_status = ssh.wait().context("等待 ssh 退出失败")?;
-    let ssh_err = stderr_reader.join().unwrap_or_default();
-    let _ = pump.join();
-    let tar_err_text = tar_err_reader.join().unwrap_or_default();
-
-    if stalled {
-        let secs = limits.idle.as_secs();
-        let human = if secs >= 60 {
-            format!("{} 分钟", secs / 60)
-        } else {
-            format!("{secs} 秒")
-        };
-        bail!("传输停滞：{human}没有收到新数据（远端命令可能已被终止），已中止（下轮重试）");
-    }
-    // 计时恰好在 ssh 自己退出之后才到点时不算超时（那次 kill 落空了）
-    if timed_out && ssh_status.code().is_none() {
-        bail!(
-            "传输超过 {} 分钟仍未完成，已中止（下轮重试）",
-            TRANSFER_TIMEOUT.as_secs() / 60
-        );
-    }
-
-    let tar_err = tar_status
-        .map(|s| !s.success())
-        .unwrap_or(true)
+    let tar_status = tar.wait().context("等待本地 tar 失败")?;
+    // Detached helpers can inherit stderr. Only consume completed readers so
+    // their descriptors cannot hold the sync lock after the deadline.
+    let ssh_err = if stderr_reader.is_finished() {
+        stderr_reader.join().unwrap_or_default()
+    } else {
+        String::new()
+    };
+    let tar_err_text = if tar_err_reader.is_finished() {
+        tar_err_reader.join().unwrap_or_default()
+    } else {
+        String::new()
+    };
+    supervision?;
+    let tar_err = (!tar_status.success())
         .then(|| ssh::last_line(&tar_err_text).unwrap_or_else(|| "tar 解包失败".to_string()));
     if !ssh_status.success() {
         let reason = ssh::describe_exit(ssh_status.code(), &ssh_err);

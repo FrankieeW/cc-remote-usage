@@ -1,5 +1,6 @@
 //! 本机镜像目录维护：按保留期清理旧日志。
 
+use crate::state::ImportBackend;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{BufRead, BufReader, Read};
@@ -15,8 +16,7 @@ pub struct Pruned {
     pub bytes: u64,
 }
 
-/// 删除 `<root>/<host>/{codex/sessions,claude/projects}` 下 mtime 早于保留期的 `.jsonl`，
-/// 并清掉因此变空的子目录。
+/// 仅清理所用导入器扫描范围内、mtime 早于保留期的 `.jsonl`，并清掉因此变空的子目录。
 ///
 /// 会话日志只追加不改写，mtime 旧就说明整份文件都是旧记录，CC Switch 早已导入
 /// （调用方保证先导入后清理）；它按文件路径记的增量断点也不受影响——远端文件以后
@@ -26,7 +26,7 @@ pub struct Pruned {
 /// `retain_days == 0` 表示不清理；符号链接一律跳过、不跟随。
 #[cfg(test)]
 pub fn prune(root: &Path, retain_days: u64, now: SystemTime) -> Pruned {
-    prune_selected(root, retain_days, now, None)
+    prune_selected(root, retain_days, now, None, &ImportBackend::Native)
 }
 
 pub fn prune_hosts(
@@ -34,8 +34,9 @@ pub fn prune_hosts(
     retain_days: u64,
     now: SystemTime,
     hosts: &HashSet<&str>,
+    backend: &ImportBackend,
 ) -> Pruned {
-    prune_selected(root, retain_days, now, Some(hosts))
+    prune_selected(root, retain_days, now, Some(hosts), backend)
 }
 
 fn prune_selected(
@@ -43,9 +44,10 @@ fn prune_selected(
     retain_days: u64,
     now: SystemTime,
     selected: Option<&HashSet<&str>>,
+    backend: &ImportBackend,
 ) -> Pruned {
     let mut acc = Pruned::default();
-    if retain_days == 0 {
+    if retain_days == 0 || !is_real_dir(root) {
         return acc;
     }
     let Some(cutoff) = now.checked_sub(Duration::from_secs(retain_days.saturating_mul(86_400)))
@@ -69,8 +71,11 @@ fn prune_selected(
             let top_dir = host.path().join(top);
             let dir = top_dir.join(sub);
             if is_real_dir(&top_dir) && is_real_dir(&dir) {
-                // 只有 Codex rollout 有父会话（parent_thread_id），Claude 目录不必逐个读首行
-                prune_dir(&dir, cutoff, top == "codex", &mut acc);
+                if top == "codex" {
+                    prune_codex(&dir, cutoff, &mut acc);
+                } else {
+                    prune_claude(&dir, cutoff, backend, &mut acc);
+                }
             }
         }
     }
@@ -86,51 +91,46 @@ fn is_real_dir(p: &Path) -> bool {
 
 struct Entry {
     path: PathBuf,
-    old: bool,
+    prunable: bool,
     len: u64,
 }
 
-fn prune_dir(dir: &Path, cutoff: SystemTime, track_parents: bool, acc: &mut Pruned) {
+fn prune_codex(dir: &Path, cutoff: SystemTime, acc: &mut Pruned) {
     let mut entries = Vec::new();
-    collect(dir, cutoff, &mut entries);
-    if !entries.iter().any(|e| e.old) {
+    collect_codex(dir, 0, cutoff, &mut entries);
+    if !entries.iter().any(|e| e.prunable) {
         return;
     }
-    let keep = if track_parents {
-        ancestors_of_retained(&entries)
-    } else {
-        HashSet::new()
-    };
-    for e in entries.iter().filter(|e| e.old && !keep.contains(&e.path)) {
-        if fs::remove_file(&e.path).is_ok() {
-            acc.files += 1;
-            acc.bytes += e.len;
+    let keep = ancestors_of_retained(&entries);
+    for e in entries {
+        if e.prunable && !keep.contains(&e.path) {
+            remove_log(dir, &e.path, e.len, acc);
         }
     }
-    remove_empty_subdirs(dir);
 }
 
-/// 递归收集 .jsonl（只认普通文件和真目录，符号链接一律跳过）
-fn collect(dir: &Path, cutoff: SystemTime, out: &mut Vec<Entry>) {
+/// 超出扫描深度的日志只能作为需要保留父会话的子会话，不能删除。
+fn collect_codex(dir: &Path, depth: u32, cutoff: SystemTime, out: &mut Vec<Entry>) {
     let Ok(rd) = fs::read_dir(dir) else { return };
     for e in rd.flatten() {
         let Ok(ft) = e.file_type() else { continue };
         let path = e.path();
         if ft.is_dir() {
-            collect(&path, cutoff, out);
+            collect_codex(&path, depth + 1, cutoff, out);
         } else if ft.is_file() && path.extension().is_some_and(|x| x == "jsonl") {
             let Ok(meta) = e.metadata() else { continue };
-            let old = meta.modified().map(|m| m < cutoff).unwrap_or(false);
+            let prunable = depth <= ccr_importer::CODEX_SESSION_MAX_DEPTH
+                && meta.modified().is_ok_and(|mtime| mtime < cutoff);
             out.push(Entry {
                 path,
-                old,
+                prunable,
                 len: meta.len(),
             });
         }
     }
 }
 
-/// 保留期内文件的父会话链上的旧文件（沿 `parent_thread_id` 一路往上）。
+/// 待保留文件的父会话链（沿 `parent_thread_id` 一路往上）。
 /// 会话 id 就是 rollout 文件名末尾的 UUID。
 fn ancestors_of_retained(entries: &[Entry]) -> HashSet<PathBuf> {
     let mut by_id: HashMap<String, Vec<&Entry>> = HashMap::new();
@@ -148,7 +148,7 @@ fn ancestors_of_retained(entries: &[Entry]) -> HashSet<PathBuf> {
     let mut visited = HashSet::new();
     let mut frontier: Vec<String> = entries
         .iter()
-        .filter(|e| !e.old)
+        .filter(|e| !e.prunable)
         .flat_map(|e| parent_ids(&e.path))
         .collect();
     while let Some(id) = frontier.pop() {
@@ -159,7 +159,7 @@ fn ancestors_of_retained(entries: &[Entry]) -> HashSet<PathBuf> {
             continue;
         };
         for parent in parents {
-            if parent.old {
+            if parent.prunable {
                 keep.insert(parent.path.clone());
             }
             frontier.extend(parent_ids(&parent.path));
@@ -212,13 +212,46 @@ fn parent_ids(p: &Path) -> Vec<String> {
     .collect()
 }
 
-/// 自底向上删空目录（`remove_dir` 遇到非空目录会失败，正好只删空的），托管目录本身保留
-fn remove_empty_subdirs(dir: &Path) {
-    let Ok(rd) = fs::read_dir(dir) else { return };
-    for e in rd.flatten() {
-        if e.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-            remove_empty_subdirs(&e.path());
-            let _ = fs::remove_dir(e.path());
+fn prune_claude(dir: &Path, cutoff: SystemTime, backend: &ImportBackend, acc: &mut Pruned) {
+    for path in ccr_importer::collect_claude_session_files(dir) {
+        if *backend == ImportBackend::CcSwitch && !cli_scans_claude_file(dir, &path) {
+            continue;
+        }
+        let Ok(meta) = fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if meta.is_file() && meta.modified().is_ok_and(|mtime| mtime < cutoff) {
+            remove_log(dir, &path, meta.len(), acc);
+        }
+    }
+}
+
+/// CC Switch CLI 5.11.3 只扫项目主日志和 SESSION/subagents 下的直接子文件。
+/// 它首先按扩展名识别日志，因此也不会下探名为 `*.jsonl` 的 SESSION 目录。
+fn cli_scans_claude_file(projects: &Path, path: &Path) -> bool {
+    let Some(parent) = path.parent().and_then(|p| p.strip_prefix(projects).ok()) else {
+        return false;
+    };
+    match parent.components().count() {
+        1 => true,
+        3 => {
+            parent.ends_with("subagents")
+                && parent
+                    .parent()
+                    .is_some_and(|session| session.extension().is_none_or(|ext| ext != "jsonl"))
+        }
+        _ => false,
+    }
+}
+
+fn remove_log(dir: &Path, path: &Path, len: u64, acc: &mut Pruned) {
+    if fs::remove_file(path).is_ok() {
+        acc.files += 1;
+        acc.bytes += len;
+        for parent in path.ancestors().skip(1) {
+            if parent == dir || fs::remove_dir(parent).is_err() {
+                break;
+            }
         }
     }
 }
@@ -317,6 +350,23 @@ mod tests {
         }
         assert!(!unrelated.exists(), "无关的旧会话照常清理");
         assert_eq!(pruned.files, 1);
+    }
+
+    #[test]
+    fn retains_ancestors_of_expired_rollouts_beyond_scan_depth() {
+        let root = scratch("prune-unscanned-parent");
+        let dir = root.join("h/codex/sessions/2026/07/10");
+        let id = "01a0aaaa-0000-7000-8000-000000000001";
+        let parent = rollout(&dir, id, None, DAY * 30);
+        let child = rollout(
+            &dir.join("nested"),
+            "01a0bbbb-0000-7000-8000-000000000002",
+            Some(id),
+            DAY * 30,
+        );
+        prune(&root, 7, SystemTime::now());
+        assert!(parent.exists());
+        assert!(child.exists());
     }
 
     #[test]

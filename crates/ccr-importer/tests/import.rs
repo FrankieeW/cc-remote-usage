@@ -220,8 +220,8 @@ fn schema_mismatch_and_write_errors_do_not_advance_cursor() {
         assert!(ccr_importer::import(&f.db, "codex", &f.codex).is_err());
     }
     c.execute_batch("PRAGMA user_version=23; CREATE TRIGGER reject_import BEFORE INSERT ON proxy_request_logs BEGIN SELECT RAISE(FAIL,'blocked'); END;").unwrap();
-    let r = ccr_importer::import(&f.db, "codex", &f.codex).unwrap();
-    assert!(!r.errors.is_empty());
+    let err = ccr_importer::import(&f.db, "codex", &f.codex).unwrap_err();
+    assert!(err.to_string().contains("blocked"), "{err}");
     assert_eq!(f.sql_i64("SELECT COUNT(*) FROM session_log_sync"), 0);
     assert_eq!(f.sql_i64("SELECT COUNT(*) FROM proxy_request_logs"), 0);
 }
@@ -642,9 +642,11 @@ fn codex_second_batch_failure_rolls_back_cursor_and_retry_deduplicates_first_bat
     .unwrap();
     drop(conn);
 
-    let failed = ccr_importer::import(&f.db, "codex", &f.codex).unwrap();
-    assert_eq!(failed.errors.len(), 1, "{:?}", failed.errors);
-    assert!(failed.errors[0].contains("injected second-batch failure"));
+    let err = ccr_importer::import(&f.db, "codex", &f.codex).unwrap_err();
+    assert!(
+        err.to_string().contains("injected second-batch failure"),
+        "{err}"
+    );
     assert_eq!(f.sql_i64("SELECT COUNT(*) FROM proxy_request_logs"), 1000);
     assert_eq!(f.sql_i64("SELECT COUNT(*) FROM session_log_sync"), 0);
 
@@ -738,6 +740,9 @@ fn claude_incomplete_tail_is_not_fingerprinted_as_committed() {
     assert!(partial.errors.is_empty(), "{:?}", partial.errors);
     assert_eq!(partial.imported, 1);
     assert_eq!(partial.deferred_files, 1);
+    let mtime = fs::metadata(&file).unwrap().modified().unwrap();
+    let retry = ccr_importer::import(&f.db, "claude", &f.claude).unwrap();
+    assert_eq!(retry.deferred_files, 1);
     assert_eq!(cursor(&f, &file), initial);
 
     write!(
@@ -746,6 +751,12 @@ fn claude_incomplete_tail_is_not_fingerprinted_as_committed() {
         msg("tail-three", 30)
     )
     .unwrap();
+    fs::File::options()
+        .write(true)
+        .open(&file)
+        .unwrap()
+        .set_modified(mtime)
+        .unwrap();
     let completed = ccr_importer::import(&f.db, "claude", &f.claude).unwrap();
     assert!(completed.errors.is_empty(), "{:?}", completed.errors);
     assert_eq!(completed.imported, 1);
@@ -759,6 +770,31 @@ fn claude_incomplete_tail_is_not_fingerprinted_as_committed() {
         cursor(&f, &file).1,
         Some(fs::metadata(&file).unwrap().len() as i64)
     );
+}
+
+#[test]
+fn unchanged_claude_tail_does_not_recreate_rolled_up_usage() {
+    let f = Fixture::new();
+    let file = f.claude.join("projects/project/session.jsonl");
+    let tail = json!({"type":"assistant", "timestamp":"2026-07-10T03:00:00Z", "message":{
+        "id":"tail-two", "model":"claude-test", "stop_reason":"end_turn",
+        "usage":{"input_tokens":100,"output_tokens":20}
+    }});
+    fs::write(file, tail.to_string()).unwrap();
+    let first = ccr_importer::import(&f.db, "claude", &f.claude).unwrap();
+    assert_eq!((first.imported, first.deferred_files), (1, 1));
+    let conn = Connection::open(&f.db).unwrap();
+    assert_eq!(
+        conn.execute(
+            "DELETE FROM proxy_request_logs WHERE request_id='session:tail-two'",
+            []
+        )
+        .unwrap(),
+        1
+    );
+    let retry = ccr_importer::import(&f.db, "claude", &f.claude).unwrap();
+    assert_eq!((retry.imported, retry.deferred_files), (0, 1));
+    assert_eq!(f.sql_i64("SELECT COUNT(*) FROM proxy_request_logs"), 0);
 }
 
 #[test]

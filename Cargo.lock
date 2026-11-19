@@ -208,6 +208,7 @@ dependencies = [
  "clap",
  "dialoguer",
  "rusqlite",
+ "rustix",
  "serde",
  "serde_json",
  "sha2",

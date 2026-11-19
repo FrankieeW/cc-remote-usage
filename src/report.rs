@@ -16,10 +16,10 @@ type Pricing = HashMap<String, Price>;
 
 #[derive(Debug, Clone)]
 struct Usage {
-    /// 去重键，同一次 API 响应只算一次：Claude 用 message.id（CC Switch 记作 `session:<id>`），
-    /// Codex 用 response_id。Claude Code 会把一次响应的每个内容块（thinking / text / tool_use）
-    /// 各写一行、usage 完全相同，不去重 Token 会算成 2~3 倍。没有 id 的记录不去重。
+    /// Codex record identity (response_id, falling back to thread + ordinal).
     key: Option<String>,
+    /// A paired snapshot can also appear in a mirror without the record.
+    snapshot_key: Option<String>,
     time: DateTime<Local>,
     model: String,
     input: i64,
@@ -153,53 +153,34 @@ fn parse_ts(s: &str) -> Option<DateTime<Local>> {
         .map(|d| d.with_timezone(&Local))
 }
 
-fn scan_codex(path: &Path, out: &mut Vec<Usage>) {
-    let Ok(f) = fs::File::open(path) else { return };
-    let mut model: Option<String> = None;
-    for line in BufReader::new(f).lines().map_while(Result::ok) {
-        if !line.contains("token_usage_record") && !line.contains("turn_context") {
-            continue;
-        }
-        let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) else {
-            continue;
+fn scan_codex(files: &[PathBuf], mut emit: impl FnMut(Usage)) {
+    ccr_importer::scan_codex_report(files, |u| {
+        let Some(time) = parse_ts(&u.timestamp) else {
+            return;
         };
-        match v["type"].as_str() {
-            Some("turn_context") => {
-                if let Some(m) = v["payload"]["model"].as_str() {
-                    model = Some(m.to_string());
-                }
-            }
-            Some("token_usage_record") => {
-                let Some(ts) = v["timestamp"].as_str().and_then(parse_ts) else {
-                    continue;
-                };
-                let payload = &v["payload"];
-                let u = &payload["usage"];
-                let input = u["input_tokens"].as_i64().unwrap_or(0);
-                let cached = u["cached_input_tokens"].as_i64().unwrap_or(0);
-                let key = payload["response_id"]
-                    .as_str()
-                    .map(|r| format!("codex:{r}"))
-                    .or_else(|| {
-                        let thread = payload["thread_id"].as_str()?;
-                        Some(format!("codex:{thread}:{}", v["ordinal"].as_i64()?))
-                    });
-                out.push(Usage {
-                    key,
-                    time: ts,
-                    model: model.clone().unwrap_or_else(|| "unknown".into()),
-                    input: (input - cached).max(0),
-                    output: u["output_tokens"].as_i64().unwrap_or(0),
-                    cache_read: cached,
-                    cache_creation: u["cache_write_input_tokens"].as_i64().unwrap_or(0),
-                });
-            }
-            _ => {}
-        }
-    }
+        emit(Usage {
+            key: u.record_key,
+            snapshot_key: u.snapshot_key,
+            time,
+            model: u.model,
+            input: u.input.into(),
+            output: u.output.into(),
+            cache_read: u.cache_read.into(),
+            cache_creation: u.cache_creation.into(),
+        });
+    });
 }
 
-fn scan_claude(path: &Path, out: &mut Vec<Usage>) {
+/// For each message keep its first host for attribution and its best usage block
+/// across all files and mirrors. The importer ranks (has_stop_reason, output_tokens).
+type ClaudeMessages = HashMap<String, (usize, bool, Usage)>;
+
+fn scan_claude(
+    path: &Path,
+    host: usize,
+    messages: &mut ClaudeMessages,
+    mut unkeyed: impl FnMut(Usage),
+) {
     let Ok(f) = fs::File::open(path) else { return };
     for line in BufReader::new(f).lines().map_while(Result::ok) {
         if !line.contains("\"assistant\"") {
@@ -218,22 +199,39 @@ fn scan_claude(path: &Path, out: &mut Vec<Usage>) {
         if !u.is_object() {
             continue;
         }
-        let key = v["message"]["id"]
+        let id = v["message"]["id"]
             .as_str()
-            .or_else(|| v["requestId"].as_str())
-            .map(|id| format!("claude:{id}"));
-        out.push(Usage {
-            key,
+            .or_else(|| v["requestId"].as_str());
+        let complete = v["message"]["stop_reason"].is_string();
+        let output = u["output_tokens"].as_i64().unwrap_or(0);
+        let existing = id.and_then(|id| messages.get_mut(id));
+        if existing
+            .as_deref()
+            .is_some_and(|(_, old_complete, old)| (complete, output) <= (*old_complete, old.output))
+        {
+            continue;
+        }
+        let usage = Usage {
+            key: None,
+            snapshot_key: None,
             time: ts,
             model: v["message"]["model"]
                 .as_str()
                 .unwrap_or("unknown")
                 .to_string(),
             input: u["input_tokens"].as_i64().unwrap_or(0),
-            output: u["output_tokens"].as_i64().unwrap_or(0),
+            output,
             cache_read: u["cache_read_input_tokens"].as_i64().unwrap_or(0),
             cache_creation: u["cache_creation_input_tokens"].as_i64().unwrap_or(0),
-        });
+        };
+        if let Some((_, old_complete, old)) = existing {
+            *old_complete = complete;
+            *old = usage;
+        } else if let Some(id) = id {
+            messages.insert(id.to_owned(), (host, complete, usage));
+        } else {
+            unkeyed(usage);
+        }
     }
 }
 
@@ -253,36 +251,38 @@ struct HostReport {
 /// （几个别名指向同一台机器）时只算给排在前面的主机，合计不会翻倍。
 fn tally(
     rep: &mut HostReport,
-    usages: &[Usage],
+    usages: impl IntoIterator<Item = Usage>,
     seen: &mut HashSet<String>,
     (since, today): (NaiveDate, NaiveDate),
     pricing: &Pricing,
 ) {
-    for u in usages {
+    for mut u in usages {
         let d = u.time.date_naive();
         if d < since {
             continue;
         }
-        if let Some(k) = &u.key {
-            if !seen.insert(k.clone()) {
-                continue;
-            }
+        let mut duplicate = false;
+        for key in [u.key.take(), u.snapshot_key.take()].into_iter().flatten() {
+            duplicate |= !seen.insert(key);
+        }
+        if duplicate {
+            continue;
         }
         let price = price_for(pricing, &u.model);
-        rep.window.add(u, price);
+        rep.window.add(&u, price);
         rep.by_model
             .entry(u.model.clone())
             .or_default()
             .1
-            .add(u, price);
-        rep.by_day.entry(d).or_default().add(u, price);
+            .add(&u, price);
+        rep.by_day.entry(d).or_default().add(&u, price);
         if d == today {
-            rep.today.add(u, price);
+            rep.today.add(&u, price);
             rep.by_model
                 .entry(u.model.clone())
                 .or_default()
                 .0
-                .add(u, price);
+                .add(&u, price);
         }
     }
 }
@@ -326,8 +326,9 @@ pub fn run(
     let pricing = load_pricing();
     let mut reports: Vec<HostReport> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
+    let mut claude_messages = ClaudeMessages::new();
 
-    for host in &hosts {
+    for (host_index, host) in hosts.iter().enumerate() {
         // 按目录决定解析器（不能看路径里有没有 "/claude/"：主机名或根目录本身可能就叫 claude）
         let mut codex_files = Vec::new();
         let mut claude_files = Vec::new();
@@ -340,21 +341,26 @@ pub fn run(
             &mut claude_files,
         );
 
-        let mut usages = Vec::new();
-        for f in &codex_files {
-            scan_codex(f, &mut usages);
-        }
-        for f in &claude_files {
-            scan_claude(f, &mut usages);
-        }
-
         let mut rep = HostReport {
             host: host.clone(),
             files: codex_files.len() + claude_files.len(),
             ..Default::default()
         };
-        tally(&mut rep, &usages, &mut seen, (since, today), &pricing);
+        let mut add = |usage| tally(&mut rep, [usage], &mut seen, (since, today), &pricing);
+        scan_codex(&codex_files, &mut add);
+        for file in &claude_files {
+            scan_claude(file, host_index, &mut claude_messages, &mut add);
+        }
         reports.push(rep);
+    }
+    for (host, _, usage) in claude_messages.into_values() {
+        tally(
+            &mut reports[host],
+            [usage],
+            &mut seen,
+            (since, today),
+            &pricing,
+        );
     }
 
     if json {
@@ -643,12 +649,16 @@ mod tests {
 {"timestamp":"2026-10-21T04:00:02Z","ordinal":21,"type":"token_usage_record","payload":{"thread_id":"t1","usage":{"input_tokens":10,"cached_input_tokens":0,"output_tokens":1}}}
 "#;
 
-    fn scan_text(name: &str, text: &str, scan: fn(&Path, &mut Vec<Usage>)) -> Vec<Usage> {
+    fn write_log(name: &str, text: &str) -> PathBuf {
         let d = crate::state::tests::scratch(name);
         let f = d.join("log.jsonl");
         fs::write(&f, text).unwrap();
+        f
+    }
+
+    fn codex_usages(name: &str, text: &str) -> Vec<Usage> {
         let mut out = Vec::new();
-        scan(&f, &mut out);
+        scan_codex(&[write_log(name, text)], |u| out.push(u));
         out
     }
 
@@ -659,15 +669,23 @@ mod tests {
 
     #[test]
     fn claude_content_blocks_count_as_one_request() {
-        let usages = scan_text("claude-dedupe", CLAUDE_LOG, scan_claude);
-        assert_eq!(usages.len(), 4, "扫描阶段保留每一行，去重在汇总时做");
+        let mut messages = ClaudeMessages::new();
+        let mut usages = Vec::new();
+        scan_claude(
+            &write_log("claude-dedupe", CLAUDE_LOG),
+            0,
+            &mut messages,
+            |u| usages.push(u),
+        );
+        usages.extend(messages.into_values().map(|(_, _, u)| u));
+        let window = window_of(&usages);
 
         let mut rep = HostReport::default();
         tally(
             &mut rep,
-            &usages,
+            usages,
             &mut HashSet::new(),
-            window_of(&usages),
+            window,
             &Pricing::new(),
         );
 
@@ -678,8 +696,123 @@ mod tests {
     }
 
     #[test]
+    fn claude_prefers_completed_then_largest_block_across_mirrors() {
+        let partial = r#"{"timestamp":"2026-10-21T03:50:11Z","type":"assistant","message":{"id":"msg","usage":{"output_tokens":1}}}"#;
+        let complete = r#"{"timestamp":"2026-10-21T03:50:12Z","type":"assistant","message":{"id":"msg","stop_reason":"end_turn","usage":{"output_tokens":10}}}
+{"timestamp":"2026-10-21T03:50:13Z","type":"assistant","message":{"id":"msg","stop_reason":"end_turn","usage":{"output_tokens":20}}}
+{"timestamp":"2026-10-21T03:50:14Z","type":"assistant","message":{"id":"msg","usage":{"output_tokens":30}}}"#;
+        let mut messages = ClaudeMessages::new();
+        let mut unkeyed = Vec::new();
+        scan_claude(&write_log("streaming", partial), 0, &mut messages, |u| {
+            unkeyed.push(u)
+        });
+        scan_claude(&write_log("complete", complete), 1, &mut messages, |u| {
+            unkeyed.push(u)
+        });
+
+        assert!(unkeyed.is_empty());
+        assert_eq!(messages.len(), 1);
+        let (host, _, usage) = &messages["msg"];
+        assert_eq!((*host, usage.output), (0, 20));
+    }
+
+    #[test]
+    fn codex_counts_snapshot_deltas_and_pairs_records_once() {
+        let log = r#"{"timestamp":"2026-10-21T04:00:00Z","type":"session_meta","payload":{"id":"thread"}}
+{"timestamp":"2026-10-21T04:00:01Z","type":"turn_context","payload":{"model":"gpt-x"}}
+{"timestamp":"2026-10-21T04:00:02Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":1000,"cached_input_tokens":400,"output_tokens":100}}}}
+{"timestamp":"2026-10-21T04:00:03Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":1000,"cached_input_tokens":400,"output_tokens":100}}}}
+{"timestamp":"2026-10-21T04:00:04Z","type":"token_usage_record","payload":{"response_id":"resp_1","usage":{"input_tokens":500,"cached_input_tokens":100,"output_tokens":25}}}
+{"timestamp":"2026-10-21T04:00:04Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":1500,"cached_input_tokens":500,"output_tokens":125}}}}"#;
+        let usages = codex_usages("mixed-snapshots", log);
+        assert_eq!(usages.len(), 2);
+        assert_eq!(
+            (usages[0].input, usages[0].cache_read, usages[0].output),
+            (600, 400, 100)
+        );
+        assert_eq!(usages[1].key.as_deref(), Some("codex:resp_1"));
+        assert_eq!(
+            (usages[1].input, usages[1].cache_read, usages[1].output),
+            (400, 100, 25)
+        );
+
+        let window = window_of(&usages);
+        let pricing = Pricing::from([("gpt-x".to_owned(), (2.0, 8.0, 1.0, 0.0))]);
+        let mut seen = HashSet::new();
+        let mut report = HostReport::default();
+        tally(&mut report, usages, &mut seen, window, &pricing);
+        assert_eq!(report.window.req, 2);
+        assert!((report.window.cost - 0.0035).abs() < 1e-9);
+
+        // Either format on its own on another host still identifies the paired request.
+        let snapshots: Vec<_> = log
+            .lines()
+            .filter(|s| !s.contains("token_usage_record"))
+            .collect();
+        let records: Vec<_> = log
+            .lines()
+            .filter(|s| s.contains("token_usage_record"))
+            .collect();
+        let mut alias = HostReport::default();
+        for lines in [snapshots, records] {
+            tally(
+                &mut alias,
+                codex_usages("mixed-alias", &lines.join("\n")),
+                &mut seen,
+                window,
+                &pricing,
+            );
+        }
+        assert_eq!(alias.window.req, 0);
+    }
+
+    #[test]
+    fn codex_resolves_replay_and_continuation_before_reporting() {
+        use serde_json::json;
+        let dir = crate::state::tests::scratch("report-replay");
+        let root = "00000000-0000-4000-8000-000000000001";
+        let child = "00000000-0000-4000-8000-000000000002";
+        let page = "00000000-0000-4000-8000-000000000003";
+        let timestamp = "2026-10-21T04:00:00Z";
+        let write =
+            |name: &str, payload, totals: &[u32]| {
+                let path = dir.join(format!("rollout-{name}.jsonl"));
+                let mut lines = vec![
+                    json!({"type":"session_meta", "timestamp":timestamp, "payload":payload})
+                        .to_string(),
+                ];
+                for &input in totals {
+                    lines.push(json!({"type":"event_msg", "timestamp":timestamp, "payload":{
+                    "type":"token_count", "info":{"total_token_usage":{"input_tokens":input}}
+                }}).to_string());
+                }
+                fs::write(&path, lines.join("\n")).unwrap();
+                path
+            };
+        let files = [
+            write(&format!("1-{root}"), json!({"id":root}), &[100]),
+            write(
+                &format!("2-{root}_{page}"),
+                json!({"id":root, "history_base":{"thread_id":root}}),
+                &[150],
+            ),
+            write(
+                &format!("3-{child}"),
+                json!({"id":child, "forked_from_id":root}),
+                &[100, 150, 175],
+            ),
+        ];
+        let mut usages = Vec::new();
+        scan_codex(&files, |u| usages.push(u));
+        assert_eq!(
+            usages.iter().map(|u| u.input).collect::<Vec<_>>(),
+            [100, 50, 25]
+        );
+    }
+
+    #[test]
     fn codex_records_carry_model_keys_and_cache_split() {
-        let usages = scan_text("codex-scan", CODEX_LOG, scan_codex);
+        let usages = codex_usages("codex-scan", CODEX_LOG);
         assert_eq!(usages.len(), 2);
         assert_eq!(usages[0].model, "gpt-x", "模型来自前面的 turn_context");
         assert_eq!(usages[0].key.as_deref(), Some("codex:resp_1"));
@@ -697,13 +830,19 @@ mod tests {
 
     #[test]
     fn same_log_mirrored_under_two_aliases_is_counted_once() {
-        let usages = scan_text("codex-alias", CODEX_LOG, scan_codex);
+        let usages = codex_usages("codex-alias", CODEX_LOG);
         let window = window_of(&usages);
         let mut seen = HashSet::new();
         let (mut first, mut alias) = (HostReport::default(), HostReport::default());
 
-        tally(&mut first, &usages, &mut seen, window, &Pricing::new());
-        tally(&mut alias, &usages, &mut seen, window, &Pricing::new());
+        tally(
+            &mut first,
+            usages.clone(),
+            &mut seen,
+            window,
+            &Pricing::new(),
+        );
+        tally(&mut alias, usages, &mut seen, window, &Pricing::new());
 
         assert_eq!(first.window.req, 2);
         assert_eq!(alias.window.req, 0, "同一份日志的第二个镜像不再计数");
@@ -711,7 +850,7 @@ mod tests {
 
     #[test]
     fn records_without_ids_are_never_merged() {
-        let mut usages = scan_text("codex-noid", CODEX_LOG, scan_codex);
+        let mut usages = codex_usages("codex-noid", CODEX_LOG);
         for u in &mut usages {
             u.key = None;
         }
@@ -719,7 +858,7 @@ mod tests {
         let doubled: Vec<Usage> = usages.iter().chain(usages.iter()).cloned().collect();
         tally(
             &mut rep,
-            &doubled,
+            doubled,
             &mut HashSet::new(),
             window_of(&usages),
             &Pricing::new(),
@@ -732,6 +871,7 @@ mod tests {
         let mut b = Bucket::default();
         let u = Usage {
             key: None,
+            snapshot_key: None,
             time: Local::now(),
             model: "m".into(),
             input: 1_000_000,
@@ -750,6 +890,7 @@ mod tests {
         let mut b = Bucket::default();
         let u = Usage {
             key: None,
+            snapshot_key: None,
             time: Local::now(),
             model: "nope".into(),
             input: 10,
