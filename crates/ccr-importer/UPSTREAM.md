@@ -34,3 +34,14 @@ and isolated database parity tests before adding support for a new schema.
   audit time: none of 1,068 mirrored files uses `history_base`, and remote sessions
   do not pass through the local proxy. Port them if servers start producing such
   forks.
+- **25** — desktop v4.0.29–v4.0.30. Migration adds `enabled_copilot` on
+  `mcp_servers` and `skills`.
+- **26** — desktop v4.0.31–v4.0.33. Migration adds `enabled_workbuddy` on those
+  tables (and backfills `enabled_omp` / `enabled_dsh` / `enabled_copilot` if missing).
+- **27** — desktop v4.0.34–v4.0.35, audited 2026-11-19. Migration adds
+  `skill_repos.host` and `skills.repo_host`.
+
+Schemas 25–27 do not change `proxy_request_logs`, `session_log_sync`,
+`model_pricing`, or `session_usage_dedup`. The same `parser_state` check used for
+schema 24 applies. The Codex 0.167+ ordinal fork check follows v4.0.35.
+A verified child imports its own per-request usage even when the parent is idle.

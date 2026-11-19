@@ -25,7 +25,7 @@ If the network blocks that, download it yourself, place it at
 
 > CC Switch must already be installed and configured on this machine.
 > `ccr config --set-importer native` uses the built-in importer (database
-> schemas 23 and 24 today). Or keep a compatible CC Switch CLI and pin the
+> schemas 23–27 today). Or keep a compatible CC Switch CLI and pin the
 > version you have checked with `ccr config --pin-cc-switch`.
 
 ## Usage

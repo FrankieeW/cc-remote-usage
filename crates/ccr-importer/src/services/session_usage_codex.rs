@@ -462,6 +462,7 @@ struct ParsedCodexFile {
     meta_thread_id: Option<String>,
     root_meta_seen: bool,
     root_timestamp: Option<DateTime<Utc>>,
+    starts_at_fork_ordinal: bool,
     parent: ParentResolution,
     token_events: Vec<ParsedTokenEvent>,
     /// `token_usage_record` 后面紧跟 last 全 0 的 `token_count` 时补记的用量。
@@ -1138,6 +1139,7 @@ fn parse_codex_file_with_index(
     let mut last_signature_by_source: HashMap<Option<String>, TokenUsageSignature> = HashMap::new();
     let mut previous_token_signature = None;
     let mut is_continuation = false;
+    let mut starts_at_fork_ordinal = false;
     let mut history_base_thread_id = None;
     let mut event_index = 0u32;
     let mut token_events = Vec::new();
@@ -1204,6 +1206,14 @@ fn parse_codex_file_with_index(
                 root_timestamp = parse_timestamp(value.get("timestamp"));
                 let payload = value.get("payload").unwrap_or(&serde_json::Value::Null);
                 parent = explicit_parent_from_meta(payload);
+                starts_at_fork_ordinal = payload
+                    .get("forked_from_ordinal_exclusive")
+                    .and_then(serde_json::Value::as_u64)
+                    .is_some_and(|boundary| {
+                        boundary > 0
+                            && value.get("ordinal").and_then(serde_json::Value::as_u64)
+                                == Some(boundary)
+                    });
 
                 meta_thread_id = non_empty_string(
                     payload
@@ -1513,6 +1523,7 @@ fn parse_codex_file_with_index(
         meta_thread_id,
         root_meta_seen,
         root_timestamp,
+        starts_at_fork_ordinal,
         parent,
         token_events,
         usage_record_events,
@@ -1528,6 +1539,30 @@ fn parse_codex_file_with_index(
 struct ParentSignatureError {
     reason: String,
     cacheable: bool,
+}
+
+fn verified_ordinal_fork(parsed: &ParsedCodexFile) -> bool {
+    let Some(cutoff) = parsed.root_timestamp else {
+        return false;
+    };
+    parsed.starts_at_fork_ordinal
+        && !parsed.token_events.is_empty()
+        && parsed
+            .token_events
+            .iter()
+            .chain(&parsed.usage_record_events)
+            .all(|event| {
+                event
+                    .signature
+                    .last
+                    .as_ref()
+                    .is_some_and(|last| last.input.is_some() && last.output.is_some())
+                    && event
+                        .timestamp
+                        .as_deref()
+                        .and_then(|timestamp| DateTime::parse_from_rfc3339(timestamp).ok())
+                        .is_some_and(|timestamp| timestamp > cutoff)
+            })
 }
 
 impl ParentSignatureError {
@@ -1968,6 +2003,7 @@ fn sync_single_codex_file(
                 pending_reason,
             ));
         }
+        ParentResolution::Parent(_) if verified_ordinal_fork(&parsed) => 0,
         ParentResolution::Parent(parent_id) => {
             let Some(cutoff) = parsed.root_timestamp else {
                 return Ok(mark_deferred(

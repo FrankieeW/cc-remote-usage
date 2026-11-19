@@ -62,11 +62,13 @@ fn real_file(path: &Path) -> bool {
 /// Only schemas audited against the desktop implementation are supported.
 ///
 /// - 23: desktop v4.0.21, the release these routines were extracted from.
-/// - 24: desktop v4.0.22–v4.0.26. The migration only adds columns: `enabled_dsh` on
-///   `mcp_servers` / `skills` (never touched here) and the nullable DeepSeek Harness
-///   parser context `session_log_sync.parser_state`. Upstream still writes Codex and
-///   Claude cursors without `parser_state`, exactly like these routines.
-const SUPPORTED_SCHEMAS: [i64; 2] = [23, 24];
+/// - 24: desktop v4.0.22–v4.0.28. Adds the nullable DeepSeek Harness parser context
+///   `session_log_sync.parser_state`. Upstream still writes Codex and Claude cursors
+///   without that column, exactly like these routines.
+/// - 25–27: desktop v4.0.29–v4.0.35. Each migration only adds columns on
+///   `mcp_servers`, `skills`, or `skill_repos`. This importer never writes those
+///   tables, and the usage tables stay the schema 24 shape.
+const SUPPORTED_SCHEMAS: [i64; 5] = [23, 24, 25, 26, 27];
 
 fn check_schema(conn: &rusqlite::Connection) -> Result<(), AppError> {
     let version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
@@ -85,7 +87,8 @@ fn check_schema(conn: &rusqlite::Connection) -> Result<(), AppError> {
     ] {
         conn.prepare(sql)?;
     }
-    // A schema 24 database is only the audited one when it carries the column added by v24.
+    // Schemas 24–27 share the audited usage tables. 24 added this column;
+    // 25–27 do not change `session_log_sync`.
     if version >= 24 {
         conn.prepare("SELECT parser_state FROM session_log_sync LIMIT 0")
             .map_err(|e| {

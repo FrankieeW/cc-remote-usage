@@ -62,7 +62,7 @@ ccr config --set-hosts netcup,frankie-vps   # fixed default hosts (no interactiv
 ccr config --set-days 3                     # how many days the first sync looks back
 ccr config --set-backoff 15,360             # backoff: 15-minute base, 6-hour cap
 ccr config --set-retain-days 7              # mirror retention in days (0 = never prune)
-ccr config --set-importer native            # built-in importer (database schemas 23 and 24)
+ccr config --set-importer native            # built-in importer (database schemas 23–27)
 ccr config --set-importer cc-switch         # switch back to the CC Switch CLI
 ccr config --pin-cc-switch                  # pin the CLI version that is installed now
 ccr config --unpin-cc-switch                # clear the version pin
@@ -102,8 +102,8 @@ labels the extra directories on their own.
 The built-in importer follows the session import from CC Switch desktop
 v4.0.21. It supports Codex and Claude, writes usage and cursors into the
 existing CC Switch database in a SQLite transaction, and does not create or
-migrate the database. It accepts only schemas 23 and 24, which were audited
-against upstream (desktop v4.0.21 through v4.0.26). An unknown database
+migrate the database. It accepts only schemas 23–27, which were audited
+against upstream (desktop v4.0.21 through v4.0.35). An unknown database
 version stops the run before any SSH probe. The database is
 `~/.cc-switch/cc-switch.db` by default. When `CC_SWITCH_CONFIG_DIR` is set,
 ccr uses the database in that directory.

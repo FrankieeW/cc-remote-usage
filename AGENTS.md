@@ -66,7 +66,7 @@ ccr daemon install --interval 900
 
 ## 关键不变量（改动前务必确认）
 
-1. 内置导入器只支持已对照上游审计过的 schema 23、24（24 必须带 `session_log_sync.parser_state` 列），预检必须先于探测/拉取；
+1. 内置导入器只支持已对照上游审计过的 schema 23–27（24–27 必须带 `session_log_sync.parser_state` 列），预检必须先于探测/拉取；
    放行新 schema 前要对照该版桌面端的迁移与导入/去重/游标代码，并在真实库快照上跑隔离对照（见 `docs/开发记录.md`）；不得创建、迁移数据库或绕过 schema 校验。遵守上游去重、计价、事务和游标契约，数据库写入失败不得推进游标或拉取断点。CLI 后端继续走 `cc-switch sessions sync-usage`。
 2. **`last_epoch` 只在成功时推进**；失败推进会导致增量窗口漏文件。
 3. **退避状态与同步状态同存 `state.json`**，`record_failure` 只累加不覆盖 `last_epoch`。

@@ -744,7 +744,7 @@ has_entry_id INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(data_source,request_id));")
 fn native_importer_preflight_stops_before_ssh_on_unknown_database_version() {
     let sb = Sandbox::new("native-preflight");
     seed_remote(&sb, "alpha");
-    let db_dir = native_database(&sb, 25);
+    let db_dir = native_database(&sb, 28);
     fs::write(
         sb.root().join("config.json"),
         r#"{"import_backend":"native"}"#,
@@ -755,7 +755,7 @@ fn native_importer_preflight_stops_before_ssh_on_unknown_database_version() {
         &[("CC_SWITCH_CONFIG_DIR", db_dir.to_str().unwrap())],
     );
     assert!(!out.status.success());
-    assert!(text(&out).contains("schema 25"), "{}", text(&out));
+    assert!(text(&out).contains("schema 28"), "{}", text(&out));
     assert!(!sb.calls().contains("ssh "));
 }
 
@@ -767,6 +767,16 @@ fn native_importer_syncs_without_cc_switch_cli() {
 #[test]
 fn native_importer_syncs_desktop_schema_24_database() {
     native_sync_round_trip("native-sync-v24", 24);
+}
+
+#[test]
+fn native_importer_syncs_desktop_schema_25_database() {
+    native_sync_round_trip("native-sync-v25", 25);
+}
+
+#[test]
+fn native_importer_syncs_desktop_schema_27_database() {
+    native_sync_round_trip("native-sync-v27", 27);
 }
 
 fn native_sync_round_trip(name: &str, schema: i64) {
