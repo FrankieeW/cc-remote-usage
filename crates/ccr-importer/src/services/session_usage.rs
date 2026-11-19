@@ -330,7 +330,7 @@ pub fn sync_claude_session_logs(
     };
 
     // 收集所有 .jsonl 文件
-    let jsonl_files = collect_jsonl_files(&projects_dir);
+    let jsonl_files = collect_claude_session_files(&projects_dir);
     let cursors = load_sync_cursors(db)?;
 
     for file_path in &jsonl_files {
@@ -398,7 +398,7 @@ pub fn sync_claude_session_logs(
 /// agent 多嵌套一层 `workflows/wf_<ID>/`。漏掉这一层会让 Workflow 的 token
 /// 用量完全不计入统计；`journal.jsonl` 不含 `type=="assistant"` 行，解析时
 /// 会被 `sync_single_file` 天然跳过，因此这里无需按文件名过滤。
-fn collect_jsonl_files(projects_dir: &Path) -> Vec<PathBuf> {
+pub fn collect_claude_session_files(projects_dir: &Path) -> Vec<PathBuf> {
     let mut files = Vec::new();
 
     let entries = match fs::read_dir(projects_dir) {
@@ -552,8 +552,8 @@ fn sync_single_file(
     let last_byte_offset = cursor.and_then(|c| c.last_byte_offset);
     let last_fingerprint = cursor.and_then(|c| c.last_tail_fingerprint);
 
-    // 文件未变化则跳过
-    if file_modified <= last_modified {
+    // tar 镜像可能在同一 mtime 下增长；游标停在半行之前时仍须重试并报告暂缓。
+    if file_modified == last_modified && last_byte_offset == Some(file_size) {
         return Ok(ClaudeFileSync::default());
     }
 
@@ -661,6 +661,14 @@ fn sync_single_file(
             committed_offset += read as i64;
         } else {
             incomplete_tail = true;
+            // 同一 mtime 下要读到换行才能确认有完整的新记录。仅剩游标后的旧残段时，
+            // 保持暂缓，不重放它：已入账的明细可能已经被桌面端汇总删除。
+            if file_modified == last_modified && last_byte_offset == Some(committed_offset) {
+                return Ok(ClaudeFileSync {
+                    incomplete_tail: true,
+                    ..Default::default()
+                });
+            }
         }
 
         if buf.iter().all(u8::is_ascii_whitespace) {
@@ -827,7 +835,6 @@ fn sync_single_file(
 
     // 更新同步状态（字节游标）。读错误时盖旧 mtime 而非当前值：盖当前值
     // 会让下轮在 mtime 门被跳过，未读完的完整行要等文件再次变化才有机会。
-    // incomplete_tail 无需此处理——半行补全必然伴随 append 抬高 mtime。
     let stamped_modified = if read_error.is_some() {
         last_modified
     } else {

@@ -45,6 +45,9 @@ use windows_sys::Win32::Storage::FileSystem::{
     FileIdInfo, GetFileInformationByHandleEx, FILE_ID_INFO,
 };
 
+mod report;
+pub use report::{scan_codex_report, CodexReportUsage};
+
 const CODEX_THREAD_REQUEST_ID_PREFIX: &str = "codex_session:thread-v1";
 
 /// 累计 token 用量（跟踪 total_token_usage 字段）
@@ -57,7 +60,7 @@ struct CumulativeTokens {
 }
 
 /// 单次 API 调用的 token 增量
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 struct DeltaTokens {
     input: u32,
     cached_input: u32,
@@ -205,8 +208,8 @@ struct ParsedTokenEvent {
     signature: TokenUsageSignature,
     delta: DeltaTokens,
     event_index: Option<u32>,
-    /// 不占用 `token_count` 序号的用量。远程压缩只写 `token_usage_record` 时用它，
-    /// 避免把后面每次请求的 `event_index` 都往后挤。
+    /// Import uses `usage:<id>` for records that have no billable snapshot.
+    /// Reports also retain the record identity on a matching snapshot for mirror dedup.
     request_suffix: Option<String>,
     model: String,
     timestamp: Option<String>,
@@ -823,7 +826,7 @@ fn signature_for_last_usage(usage: &CumulativeTokens) -> TokenUsageSignature {
 }
 
 struct PendingUsageRecord {
-    key: String,
+    key: Option<String>,
     usage: CumulativeTokens,
     timestamp: Option<String>,
     model: String,
@@ -834,9 +837,10 @@ fn push_unmatched_usage(
     pending: PendingUsageRecord,
     flush_line_offset: i64,
     has_billable_tokens: &mut bool,
+    keep_empty: bool,
 ) {
     let delta = delta_from_usage(&pending.usage);
-    if delta.is_zero() {
+    if delta.is_zero() && !keep_empty {
         return;
     }
     *has_billable_tokens = true;
@@ -850,7 +854,7 @@ fn push_unmatched_usage(
         signature: signature_for_last_usage(&pending.usage),
         delta,
         event_index: None,
-        request_suffix: Some(format!("usage:{}", pending.key)),
+        request_suffix: pending.key,
         model: pending.model,
         timestamp: pending.timestamp,
         timing: None,
@@ -972,7 +976,7 @@ fn collect_codex_session_files(codex_dir: &Path) -> Vec<PathBuf> {
     // 1. 扫描 sessions/YYYY/MM/DD/*.jsonl（日期分区目录）
     let sessions_dir = codex_dir.join("sessions");
     if crate::real_dir(&sessions_dir) {
-        collect_jsonl_recursive(&sessions_dir, &mut files, 0, 3);
+        collect_jsonl_recursive(&sessions_dir, &mut files, 0, crate::CODEX_SESSION_MAX_DEPTH);
     }
 
     // 2. 扫描 archived_sessions/*.jsonl（扁平归档目录）
@@ -1104,13 +1108,29 @@ fn parse_codex_file(
     file_path: &Path,
     root_thread_id: Option<String>,
 ) -> Result<ParsedCodexFile, AppError> {
-    parse_codex_file_with_index(file_path, root_thread_id, None)
+    parse_codex_file_with_index(file_path, root_thread_id, None, ParseMode::Import)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ParseMode {
+    Import,
+    Report,
+}
+
+impl ParseMode {
+    fn model(self, raw: &str) -> String {
+        match self {
+            Self::Import => normalize_codex_model(raw),
+            Self::Report => raw.to_owned(),
+        }
+    }
 }
 
 fn parse_codex_file_with_index(
     file_path: &Path,
     root_thread_id: Option<String>,
     rollout_index: Option<&RolloutIndex>,
+    mode: ParseMode,
 ) -> Result<ParsedCodexFile, AppError> {
     let file =
         fs::File::open(file_path).map_err(|e| AppError::Config(format!("无法打开文件: {e}")))?;
@@ -1180,7 +1200,9 @@ fn parse_codex_file_with_index(
             continue;
         }
 
-        timer.observe_line(&line);
+        if mode == ParseMode::Import {
+            timer.observe_line(&line);
+        }
 
         let is_event_msg = line.contains("\"event_msg\"");
         let is_turn_context = line.contains("\"turn_context\"");
@@ -1303,7 +1325,7 @@ fn parse_codex_file_with_index(
                         .or_else(|| payload.get("info").and_then(|info| info.get("model")))
                         .and_then(serde_json::Value::as_str)
                     {
-                        current_model = normalize_codex_model(model);
+                        current_model = mode.model(model);
                     }
                 }
             }
@@ -1324,7 +1346,7 @@ fn parse_codex_file_with_index(
                         .map(str::trim)
                         .filter(|model| !model.is_empty())
                     {
-                        current_model = normalize_codex_model(model);
+                        current_model = mode.model(model);
                     }
                     continue;
                 }
@@ -1344,7 +1366,7 @@ fn parse_codex_file_with_index(
                     .or_else(|| payload.get("model"))
                     .and_then(serde_json::Value::as_str)
                 {
-                    current_model = normalize_codex_model(model);
+                    current_model = mode.model(model);
                 }
 
                 let snapshot_source = token_snapshot_source(payload);
@@ -1354,6 +1376,7 @@ fn parse_codex_file_with_index(
                 let last = info
                     .get("last_token_usage")
                     .and_then(parse_cumulative_tokens);
+                let mut paired_record = None;
                 if let Some(pending) = pending_usage.take() {
                     // 对得上的 last 已经由这条 token_count 入账。last 为 0 是远程压缩
                     // 把本次用量只写在 token_usage_record 里之后的空快照。其它对不上的
@@ -1367,7 +1390,10 @@ fn parse_codex_file_with_index(
                             pending,
                             line_offset,
                             &mut has_billable_tokens,
+                            false,
                         );
+                    } else if mode == ParseMode::Report {
+                        paired_record = Some(pending);
                     }
                 }
                 if total.is_none() && last.is_none() {
@@ -1382,7 +1408,6 @@ fn parse_codex_file_with_index(
                 }
                 previous_token_signature = Some(signature.clone());
 
-                let request_usage = last.clone();
                 let delta = if duplicate_snapshot {
                     DeltaTokens {
                         input: 0,
@@ -1390,7 +1415,7 @@ fn parse_codex_file_with_index(
                         cache_write_input: 0,
                         output: 0,
                     }
-                } else if let Some(last) = last {
+                } else if let Some(last) = last.as_ref() {
                     // Codex provides the exact per-request usage. Prefer it to
                     // subtracting cumulative snapshots, which may come from
                     // multiple independently advancing rate-limit lanes.
@@ -1462,43 +1487,66 @@ fn parse_codex_file_with_index(
                     .and_then(serde_json::Value::as_str)
                     .map(str::to_owned);
                 // 重复快照（限额刷新时重发的）不是一次请求，不参与计时
-                let timing = nonzero_index.and_then(|_| {
+                let timing = if mode == ParseMode::Import && nonzero_index.is_some() {
                     timer.finish_request(
                         timestamp.as_deref().and_then(parse_timestamp_millis),
-                        request_usage.as_ref(),
+                        last.as_ref(),
                     )
-                });
+                } else {
+                    None
+                };
+                let record_key = paired_record
+                    .filter(|p| delta_from_usage(&p.usage) == delta)
+                    .and_then(|p| p.key);
 
                 token_events.push(ParsedTokenEvent {
                     line_offset,
                     signature,
                     delta,
                     event_index: nonzero_index,
-                    request_suffix: None,
+                    request_suffix: record_key,
                     model: current_model.clone(),
                     timestamp,
                     timing,
                 });
             }
             "token_usage_record" => {
+                // Reports also count requests recorded without a following snapshot.
+                if mode == ParseMode::Report {
+                    if let Some(pending) = pending_usage.take() {
+                        push_unmatched_usage(
+                            &mut usage_record_events,
+                            pending,
+                            line_offset - 1,
+                            &mut has_billable_tokens,
+                            true,
+                        );
+                    }
+                }
                 pending_usage = None;
                 let Some(payload) = value.get("payload") else {
                     continue;
                 };
-                let Some(usage) = payload.get("usage").and_then(parse_cumulative_tokens) else {
-                    continue;
+                let usage = match payload.get("usage").and_then(parse_cumulative_tokens) {
+                    Some(usage) if mode == ParseMode::Report || !usage_is_zero(&usage) => usage,
+                    None if mode == ParseMode::Report => CumulativeTokens::default(),
+                    _ => continue,
                 };
-                if usage_is_zero(&usage) {
-                    continue;
-                }
                 let response_id = payload
                     .get("response_id")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("");
-                let key = if response_id.is_empty() {
-                    format!("line{line_offset}")
-                } else {
-                    response_id.to_string()
+                    .and_then(serde_json::Value::as_str);
+                let key = match mode {
+                    ParseMode::Report => {
+                        response_id.map(|id| format!("codex:{id}")).or_else(|| {
+                            let thread = payload.get("thread_id")?.as_str()?;
+                            let ordinal = value.get("ordinal")?.as_i64()?;
+                            Some(format!("codex:{thread}:{ordinal}"))
+                        })
+                    }
+                    ParseMode::Import => Some(match response_id.filter(|id| !id.is_empty()) {
+                        Some(id) => format!("usage:{id}"),
+                        None => format!("usage:line{line_offset}"),
+                    }),
                 };
                 pending_usage = Some(PendingUsageRecord {
                     key,
@@ -1511,6 +1559,17 @@ fn parse_codex_file_with_index(
                 });
             }
             _ => {}
+        }
+    }
+    if mode == ParseMode::Report {
+        if let Some(pending) = pending_usage {
+            push_unmatched_usage(
+                &mut usage_record_events,
+                pending,
+                line_offset,
+                &mut has_billable_tokens,
+                true,
+            );
         }
     }
 
@@ -1928,6 +1987,7 @@ fn sync_single_codex_file(
         file_path,
         thread_id_from_filename(file_path),
         Some(rollout_index),
+        ParseMode::Import,
     )?;
     if !parsed.has_billable_tokens {
         update_codex_sync_state(db, &file_path_str, file_modified, &parsed)?;

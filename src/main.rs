@@ -442,7 +442,13 @@ fn cmd_hosts(probe: bool, json: bool, force: bool) -> Result<()> {
 /// 导入完成后按保留期清理镜像（先导入后清理，删掉的都是早已入库的旧文件）。
 /// 配置文件解析失败时不清理：按默认值删文件可能违背用户的设置（比如 `retain_days: 0`）。
 fn prune_mirrors(cfg: &Config, quiet: bool, hosts: &std::collections::HashSet<&str>) {
-    let pruned = mirror::prune_hosts(&root(), cfg.retain_days, SystemTime::now(), hosts);
+    let pruned = mirror::prune_hosts(
+        &root(),
+        cfg.retain_days,
+        SystemTime::now(),
+        hosts,
+        &cfg.import_backend,
+    );
     if !quiet && pruned.files > 0 {
         println!(
             "清理镜像：删除 {} 个超过 {} 天未更新的日志，释放 {}",

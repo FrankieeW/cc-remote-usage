@@ -215,6 +215,10 @@ fn sync_pulls_imports_per_app_prunes_and_records_failures() {
         .root()
         .join("alpha/codex/sessions/2026/01/02/rollout-stale.jsonl");
     touch(&stale, DAY * 30);
+    let workflow = sb
+        .root()
+        .join("alpha/claude/projects/p/id/subagents/workflows/wf_1/session.jsonl");
+    touch(&workflow, DAY * 30);
 
     let out = sb.ccr(&["sync", "alpha", "deadbox"], &[]);
     assert!(!out.status.success(), "部分同步失败必须返回非零退出码");
@@ -231,6 +235,7 @@ fn sync_pulls_imports_per_app_prunes_and_records_failures() {
         "首次只回溯 days 天"
     );
     assert!(!stale.exists(), "导入后清理超过保留期的镜像");
+    assert!(workflow.exists(), "CLI 后端未扫描的 Workflow 日志必须保留");
 
     let calls = sb.calls();
     assert!(calls.contains("RemoteCommand=none") && calls.contains("BatchMode=yes"));
@@ -664,7 +669,7 @@ fn stalled_transfer_is_aborted_instead_of_hanging_the_run() {
     let (out, timed_out) = sb.ccr_with_timeout(
         &["sync", "stallbox"],
         &[("CCR_TRANSFER_IDLE_SECS", "2")],
-        Duration::from_secs(60),
+        Duration::from_secs(10),
     );
     assert!(
         !timed_out,
@@ -689,6 +694,36 @@ fn stalled_transfer_is_aborted_instead_of_hanging_the_run() {
         Some(1),
         "停滞算一次失败，进入退避"
     );
+}
+
+#[test]
+fn failed_extractor_aborts_ssh_before_the_idle_deadline() {
+    let sb = Sandbox::new("early-tar-exit");
+    seed_remote(&sb, "stallbox");
+    sb.executable("bin/tar", "#!/bin/sh\nexit 2\n");
+    let (out, timed_out) = sb.ccr_with_timeout(&["sync", "stallbox"], &[], Duration::from_secs(10));
+    assert!(!timed_out, "tar 已退出，不能再等 ssh 或它的子进程");
+    assert!(!out.status.success());
+    assert_eq!(sb.state()["hosts"]["stallbox"]["last_epoch"], 0);
+}
+
+#[test]
+fn failed_remote_find_keeps_the_previous_checkpoint() {
+    let sb = Sandbox::new("find-failed");
+    seed_remote(&sb, "alpha");
+    fs::write(
+        sb.root().join("state.json"),
+        r#"{"hosts":{"alpha":{"last_epoch":123}}}"#,
+    )
+    .unwrap();
+    sb.executable(
+        "bin/find",
+        "#!/bin/sh\necho unreadable-directory >&2\nexit 1\n",
+    );
+    let out = sb.ccr(&["sync", "alpha"], &[]);
+    assert!(!out.status.success());
+    assert_eq!(sb.state()["hosts"]["alpha"]["last_epoch"], 123);
+    assert!(!sb.calls().contains("sync-usage"));
 }
 
 /// 传输停滞不能推进增量断点：拉了一半的日志不算同步成功，下轮还要重来。
@@ -825,6 +860,52 @@ fn native_sync_round_trip(name: &str, schema: i64) {
         )
         .unwrap();
     assert_eq!(count, 1);
+}
+
+#[test]
+fn native_import_prunes_only_scanned_layouts() {
+    let sb = Sandbox::new("native-import-prune-layouts");
+    let db_dir = native_database(&sb, 23);
+    let env = [("CC_SWITCH_CONFIG_DIR", db_dir.to_str().unwrap())];
+    fs::write(
+        sb.root().join("config.json"),
+        r#"{"import_backend":"native"}"#,
+    )
+    .unwrap();
+    let host = sb.root().join("alpha");
+    let unscanned = [
+        "codex/sessions/2026/07/10/nested/rollout-old.jsonl",
+        "claude/projects/p/id/other/session.jsonl",
+        "claude/projects/p/id/subagents/workflows/outside-workflow.jsonl",
+    ];
+    for path in unscanned {
+        touch(&host.join(path), DAY * 30);
+    }
+
+    let out = sb.ccr(&["import", "alpha"], &env);
+    assert!(out.status.success(), "{}", text(&out));
+    assert_eq!(sb.state()["hosts"]["alpha"]["last_scanned"], 0);
+    for path in unscanned {
+        assert!(host.join(path).exists(), "{path}");
+    }
+
+    let scanned = [
+        "codex/sessions/2026/07/10/rollout-old.jsonl",
+        "claude/projects/p/id/subagents/session.jsonl",
+        "claude/projects/p/id/subagents/workflows/wf_1/session.jsonl",
+    ];
+    for path in scanned {
+        touch(&host.join(path), DAY * 30);
+    }
+    let out = sb.ccr(&["import", "alpha"], &env);
+    assert!(out.status.success(), "{}", text(&out));
+    assert_eq!(sb.state()["hosts"]["alpha"]["last_scanned"], 3);
+    for path in scanned {
+        assert!(!host.join(path).exists(), "{path}");
+    }
+    for path in unscanned {
+        assert!(host.join(path).exists(), "{path}");
+    }
 }
 
 #[test]

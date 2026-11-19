@@ -38,6 +38,7 @@ pub fn run(hosts: Vec<String>, quiet: bool) -> Result<()> {
                         cfg.retain_days,
                         SystemTime::now(),
                         &HashSet::from([host.as_str()]),
+                        &cfg.import_backend,
                     );
                 }
             }
