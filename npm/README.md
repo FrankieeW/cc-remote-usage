@@ -1,56 +1,69 @@
 # cc-remote-usage
 
-把跑在服务器上的 **Codex / Claude Code agent 用量**同步进 [CC Switch](https://github.com/farion1231/cc-switch)
-的「用量」看板 —— 自动发现 SSH 主机、交互选择要同步哪几台、增量拉取会话日志。
+Pull **Codex / Claude Code agent usage** from your servers into the
+[CC Switch](https://github.com/farion1231/cc-switch) Usage dashboard.
+ccr discovers SSH hosts, lets you pick which ones to sync, and incrementally
+fetches their session logs.
 
-Rust 编写的单文件二进制，npm 包只是分发壳（安装时按平台自动下载对应二进制）。
+The program is a single Rust binary. This npm package is the installer: on
+install it downloads the binary for your platform.
 
-## 安装
+[中文说明](https://github.com/FrankieeW/cc-remote-usage/blob/master/README.md)
+· [Full English docs](https://github.com/FrankieeW/cc-remote-usage/blob/master/README.en.md)
+
+## Install
 
 ```bash
 npm i -g cc-remote-usage
 ccr --version
 ```
 
-支持 macOS（arm64/x64）与 Linux（arm64/x64）。安装时会从
-[GitHub Releases](https://github.com/FrankieeW/cc-remote-usage/releases) 下载对应平台的二进制；
-网络受限时可手动下载后放到包内 `vendor/<platform>-<arch>/ccr` 并 `chmod +x`。
+macOS (arm64/x64) and Linux (arm64/x64). The installer downloads the matching
+binary from [GitHub Releases](https://github.com/FrankieeW/cc-remote-usage/releases).
+If the network blocks that, download it yourself, place it at
+`vendor/<platform>-<arch>/ccr` inside the package, and `chmod +x`.
 
-> 需要本机已安装并配置好 CC Switch。可运行 `ccr config --set-importer native`
-> 使用内置导入器（目前支持数据库 schema 23、24）；也可使用兼容的 CC Switch CLI，
-> 通过 `ccr config --pin-cc-switch` 锁定已确认的 CLI 版本。
+> CC Switch must already be installed and configured on this machine.
+> `ccr config --set-importer native` uses the built-in importer (database
+> schemas 23 and 24 today). Or keep a compatible CC Switch CLI and pin the
+> version you have checked with `ccr config --pin-cc-switch`.
 
-## 用法
+## Usage
 
 ```bash
-ccr hosts --probe          # 发现并探测可同步的服务器
-ccr sync                   # 交互多选 → 增量同步 → 导入 CC Switch
-ccr sync --all --quiet     # 全自动（定时任务用）
-ccr import netcup          # 只重试本地镜像导入，不连接服务器
-ccr report --days 7        # 按服务器/模型汇总 Token 与花费
-ccr status                 # 同步状态、失败次数、下次重试时间
-ccr daemon install         # 装 launchd 定时任务（每 15 分钟）
+ccr hosts --probe          # discover servers and probe which ones can sync
+ccr sync                   # pick hosts → incremental sync → import into CC Switch
+ccr sync --all --quiet     # unattended (for a scheduler)
+ccr import netcup          # retry import of the local mirror; no SSH
+ccr report --days 7        # tokens and cost, by server and model
+ccr status                 # last sync, failure count, next retry
+ccr daemon install         # install a launchd job (every 15 minutes)
 ```
 
-完整的参数说明见 [README](https://github.com/FrankieeW/cc-remote-usage#用法)。
+Command help and status text are in Chinese. Flag reference:
+[English](https://github.com/FrankieeW/cc-remote-usage/blob/master/README.en.md#usage),
+[中文](https://github.com/FrankieeW/cc-remote-usage/blob/master/README.md#用法).
 
-Pharos 等编排器使用独立 `CODEX_HOME` 时，需要显式添加日志目录，默认不会自动搜索：
+When an orchestrator such as Pharos uses its own `CODEX_HOME`, add that log
+directory yourself. ccr does not search for it:
 
 ```bash
 ccr config --add-codex-root 'server=/srv/pharos/runtime/projects'
 ccr sync server
 ```
 
-首次完整回补，之后增量同步；只传输 `sessions` / `archived_sessions` 下的 JSONL。
-同步或导入只要有主机失败，就返回非零退出码，`--quiet` 同样适用。
+The first sync of a new directory is a full backfill. Later syncs are
+incremental. Only `.jsonl` files under `sessions/` and `archived_sessions/`
+are transferred. `ccr sync` and `ccr import` exit non-zero when any host
+fails, including with `--quiet`.
 
-## 环境变量
+## Environment variables
 
-| 变量 | 用途 |
+| Variable | Purpose |
 |---|---|
-| `CCR_BINARY_PATH` | 覆盖要执行的二进制路径 |
-| `CCR_LOCAL_BINARY` | 安装时直接用本地二进制，不下载（离线/开发用） |
+| `CCR_BINARY_PATH` | Override the binary this package runs |
+| `CCR_LOCAL_BINARY` | Use a local binary at install time, and skip the download (offline or development) |
 
-## 许可
+## License
 
 MIT

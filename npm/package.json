@@ -1,7 +1,7 @@
 {
   "name": "cc-remote-usage",
   "version": "0.4.2",
-  "description": "把服务器上 Codex / Claude Code agent 的用量同步进 CC Switch（自动发现 SSH 主机 + 交互选择）",
+  "description": "Sync Codex / Claude Code agent usage from servers into the CC Switch dashboard",
   "bin": {
     "ccr": "bin/ccr.js"
   },
