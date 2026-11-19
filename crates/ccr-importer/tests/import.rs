@@ -186,7 +186,7 @@ fn schema_mismatch_and_write_errors_do_not_advance_cursor() {
         ],
     );
     let c = Connection::open(&f.db).unwrap();
-    for unsupported in [22, 25] {
+    for unsupported in [22, 28] {
         c.execute_batch(&format!("PRAGMA user_version={unsupported};"))
             .unwrap();
         let err = ccr_importer::preflight(&f.db).unwrap_err().to_string();
@@ -264,6 +264,39 @@ fn schema_24_imports_both_apps_without_touching_desktop_parser_state() {
         )
         .unwrap();
     assert_eq!(kept, (42, "{\"pending\":true}".to_string()));
+}
+
+/// Desktop v4.0.29–v4.0.35 (schema 25–27) only add MCP and skill columns.
+/// Usage import stays on the schema 24 tables.
+#[test]
+fn schemas_25_through_27_import_on_the_same_usage_tables() {
+    for version in [25, 26, 27] {
+        let f = Fixture::new();
+        upgrade_to_schema_24(&f.db);
+        Connection::open(&f.db)
+            .unwrap()
+            .execute_batch(&format!("PRAGMA user_version={version};"))
+            .unwrap();
+        ccr_importer::preflight(&f.db).unwrap();
+        write_lines(
+            &f.codex_file(ID),
+            &[
+                meta(ID, None),
+                context(),
+                tokens(1000, 400, 100, "2026-07-10T03:00:02Z"),
+            ],
+        );
+        let r = ccr_importer::import(&f.db, "codex", &f.codex).unwrap();
+        assert!(r.errors.is_empty(), "{version}: {:?}", r.errors);
+        assert_eq!(r.imported, 1, "{version}");
+        assert_eq!(
+            ccr_importer::import(&f.db, "codex", &f.codex)
+                .unwrap()
+                .imported,
+            0,
+            "{version} must stay idempotent"
+        );
+    }
 }
 
 #[test]
